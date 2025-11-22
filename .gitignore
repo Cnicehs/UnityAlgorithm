@@ -1,0 +1,38 @@
+# Unity
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# Visual Studio
+.vs/
+*.csproj
+*.unityproj
+*.sln
+
+# Rider
+.idea/
+*.pidb
+*.suo
+*.user
+*.userprefs
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Packages
+# Exclude actual package files, but keep manifest and lock files
+Packages/*
+!Packages/manifest.json
+!Packages/packages-lock.json
+
+# Optional: Recordings from Unity Recorder
+# Recordings/
+
+# Optional: WebGL build output
+# WebGLBuild/
