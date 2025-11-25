@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using Cysharp.Threading.Tasks;
 
 public class SpatialGridIndex : ISpatialIndex
 {
@@ -29,8 +30,13 @@ public class SpatialGridIndex : ISpatialIndex
         _next = new int[0];
     }
 
-    public void Build(List<Vector2> positions)
+    public UniTask BuildAsync(List<Vector2> positions)
     {
+        // Grid build is fast and hard to parallelize (write conflicts).
+        // We run it synchronously on the calling thread (which should be a background thread).
+        // Or we can wrap it in UniTask.Run if called from main thread, but Manager calls us on ThreadPool.
+        // So we just do the work.
+        
         _positions = positions;
         int count = positions.Count;
         
@@ -62,17 +68,24 @@ public class SpatialGridIndex : ISpatialIndex
             _next[i] = _gridHead[cellIndex];
             _gridHead[cellIndex] = i;
         }
+        
+        return UniTask.CompletedTask;
     }
+
+    // Cache for query candidates
+    private List<Candidate> _candidateCache = new List<Candidate>();
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
         results.Clear();
         
-        // Optimization: Store (index, distSq) to avoid recalculating distances during sort
-        // We use a list of structs to minimize GC (struct is value type)
-        // But List<T> is a class, so it allocates. We can reuse a static list or pool if needed.
-        // For now, just local list but with capacity.
-        var candidates = new List<Candidate>(k * 4); 
+        // Reuse cache
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k * 4)
+        {
+            _candidateCache.Capacity = k * 4;
+        }
+        var candidates = _candidateCache; 
 
         int startX = Mathf.FloorToInt((position.x - _origin.x) / _cellSize);
         int startY = Mathf.FloorToInt((position.y - _origin.y) / _cellSize);

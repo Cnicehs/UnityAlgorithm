@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
-using System;
+using Cysharp.Threading.Tasks;
+using System.Threading.Tasks;
 
 public class KDTreeIndex : ISpatialIndex
 {
@@ -19,13 +20,18 @@ public class KDTreeIndex : ISpatialIndex
     private List<Vector2> _positions;
     private int[] _indicesBuffer; // Reusable buffer for building
 
+    // Threshold for switching to parallel build
+    private const int ParallelThreshold = 4096;
+    // Max depth for parallelism to avoid over-threading (2^4 = 16 tasks)
+    private const int MaxParallelDepth = 4;
+
     public KDTreeIndex(int capacity)
     {
         _nodes = new Node[capacity];
         _indicesBuffer = new int[capacity];
     }
 
-    public void Build(List<Vector2> positions)
+    public UniTask BuildAsync(List<Vector2> positions)
     {
         _positions = positions;
         int count = positions.Count;
@@ -41,18 +47,35 @@ public class KDTreeIndex : ISpatialIndex
             _indicesBuffer[i] = i;
         }
 
-        _rootIndex = BuildRecursive(0, count - 0, 0);
+        // Run synchronously (caller handles threading)
+        _rootIndex = BuildRecursive(0, count, 0);
+        
+        return UniTask.CompletedTask;
+    }
+
+    // Iterative Build
+    private struct BuildJob
+    {
+        public int Start;
+        public int Length;
+        public int Depth;
+        public int ParentIndex; // Index of the parent node in _nodes array
+        public bool IsLeft;     // Is this the left child of the parent?
     }
 
     private int BuildRecursive(int start, int length, int depth)
     {
+        // For the top-level parallel part, we keep the recursive structure 
+        // because Parallel.Invoke is naturally recursive (fork-join).
+        // However, once we switch to synchronous execution, we use a loop.
+        
         if (length <= 0) return -1;
 
         int axis = depth % 2;
         int mid = length / 2;
         int medianIndex = start + mid;
 
-        // Quick select to find median
+        // Partition
         QuickSelect(start, length, mid, axis);
 
         int nodeIndex = _indicesBuffer[medianIndex];
@@ -62,16 +85,100 @@ public class KDTreeIndex : ISpatialIndex
         _nodes[nodeIndex].UnitIndex = nodeIndex;
         _nodes[nodeIndex].SplitValue = (axis == 0) ? pos.x : pos.y;
 
-        // Calculate bounds for this node (could be optimized by passing down bounds)
-        // For simple KDTree, we might not need full bounds stored if we just use plane splitting logic.
-        // But storing bounds helps with "Ball-Rectangle" intersection tests for KNN.
-        // For now, let's stick to standard KDTree traversal without explicit bounds storage per node to save memory,
-        // relying on the recursion stack to track current bounds.
-        
-        _nodes[nodeIndex].Left = BuildRecursive(start, mid, depth + 1);
-        _nodes[nodeIndex].Right = BuildRecursive(start + mid + 1, length - mid - 1, depth + 1);
+        // Parallel Fork-Join
+        if (depth < MaxParallelDepth && length >= ParallelThreshold)
+        {
+            int leftResult = -1;
+            int rightResult = -1;
+
+            Parallel.Invoke(
+                () => leftResult = BuildRecursive(start, mid, depth + 1),
+                () => rightResult = BuildRecursive(start + mid + 1, length - mid - 1, depth + 1)
+            );
+
+            _nodes[nodeIndex].Left = leftResult;
+            _nodes[nodeIndex].Right = rightResult;
+        }
+        else
+        {
+            // Switch to Iterative Build for the subtree
+            // We already built the current node, now build children iteratively
+            
+            // We need to manually build the children and link them.
+            // But BuildIterative returns void, it links to parent.
+            // So we pass the current node as parent.
+            
+            BuildIterative(start, mid, depth + 1, nodeIndex, true);
+            BuildIterative(start + mid + 1, length - mid - 1, depth + 1, nodeIndex, false);
+        }
 
         return nodeIndex;
+    }
+
+    private void BuildIterative(int rootStart, int rootLength, int rootDepth, int rootParent, bool rootIsLeft)
+    {
+        // Stack for iterative build
+        // We can reuse a stack if we want to be super optimized, but a local stack is fine.
+        var stack = new Stack<BuildJob>();
+        stack.Push(new BuildJob 
+        { 
+            Start = rootStart, 
+            Length = rootLength, 
+            Depth = rootDepth, 
+            ParentIndex = rootParent, 
+            IsLeft = rootIsLeft 
+        });
+
+        while (stack.Count > 0)
+        {
+            var job = stack.Pop();
+            
+            if (job.Length <= 0)
+            {
+                // No node to create, link -1 to parent
+                if (job.IsLeft) _nodes[job.ParentIndex].Left = -1;
+                else _nodes[job.ParentIndex].Right = -1;
+                continue;
+            }
+
+            int axis = job.Depth % 2;
+            int mid = job.Length / 2;
+            int medianIndex = job.Start + mid;
+
+            // Partition
+            QuickSelect(job.Start, job.Length, mid, axis);
+
+            int nodeIndex = _indicesBuffer[medianIndex];
+            Vector2 pos = _positions[nodeIndex];
+
+            _nodes[nodeIndex].Axis = axis;
+            _nodes[nodeIndex].UnitIndex = nodeIndex;
+            _nodes[nodeIndex].SplitValue = (axis == 0) ? pos.x : pos.y;
+
+            // Link to parent
+            if (job.IsLeft) _nodes[job.ParentIndex].Left = nodeIndex;
+            else _nodes[job.ParentIndex].Right = nodeIndex;
+
+            // Push children
+            // Push Right first so Left is processed first (standard DFS order, though order doesn't strictly matter here)
+            stack.Push(new BuildJob 
+            { 
+                Start = job.Start + mid + 1, 
+                Length = job.Length - mid - 1, 
+                Depth = job.Depth + 1, 
+                ParentIndex = nodeIndex, 
+                IsLeft = false 
+            });
+
+            stack.Push(new BuildJob 
+            { 
+                Start = job.Start, 
+                Length = mid, 
+                Depth = job.Depth + 1, 
+                ParentIndex = nodeIndex, 
+                IsLeft = true 
+            });
+        }
     }
 
     private void QuickSelect(int start, int length, int k, int axis)
@@ -122,84 +229,101 @@ public class KDTreeIndex : ISpatialIndex
         _indicesBuffer[j] = temp;
     }
 
+    // Cache for query candidates to avoid GC
+    private List<(int index, float distSq)> _candidateCache = new List<(int index, float distSq)>();
+    
+    // Stack for iterative search to avoid recursion
+    private struct SearchJob
+    {
+        public int NodeIndex;
+        public float MinDistSq; // Minimum distance from target to this node's bounding box (splitting plane logic)
+    }
+    private Stack<SearchJob> _searchStack = new Stack<SearchJob>(64); // Pre-allocate
+
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
         results.Clear();
-        // Use a max-heap to store the K nearest neighbors found so far.
-        // Since we want the K *nearest*, we keep the K smallest distances.
-        // A max-heap of size K allows us to quickly check if a new point is closer than the furthest of our current best K.
-        // If it is, we pop the max and insert the new one.
         
-        // C# PriorityQueue is available in .NET 6 / Unity 2021.2+.
-        // Assuming older Unity or "Pure C#", let's implement a simple custom MaxHeap or just use a List and Sort (slow for inserts).
-        // For K=1 (common), simple variable. For K small, List is fine.
+        // Reuse cache
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k + 1)
+        {
+            _candidateCache.Capacity = k + 1;
+        }
         
-        // Let's use a custom simple MaxHeap for performance.
-        // Actually, for simplicity in this demo, let's use a List and Sort, but optimize:
-        // Only sort when full.
-        
-        // Better: Maintain a list of (index, distSq).
-        
-        List<(int index, float distSq)> best = new List<(int index, float distSq)>(k + 1);
-        
-        SearchKNN(_rootIndex, position, k, best);
+        SearchKNNIterative(_rootIndex, position, k, _candidateCache);
         
         // Extract indices
-        for (int i = 0; i < best.Count; i++)
+        for (int i = 0; i < _candidateCache.Count; i++)
         {
-            results.Add(best[i].index);
+            results.Add(_candidateCache[i].index);
         }
     }
 
-    private void SearchKNN(int nodeIndex, Vector2 target, int k, List<(int index, float distSq)> best)
+    private void SearchKNNIterative(int rootIndex, Vector2 target, int k, List<(int index, float distSq)> best)
     {
-        if (nodeIndex == -1) return;
+        if (rootIndex == -1) return;
 
-        int unitIdx = _nodes[nodeIndex].UnitIndex;
-        float distSq = (_positions[unitIdx] - target).sqrMagnitude;
+        _searchStack.Clear();
+        _searchStack.Push(new SearchJob { NodeIndex = rootIndex, MinDistSq = 0f });
 
-        // Try to add to best
-        AddCandidate(unitIdx, distSq, k, best);
-
-        // Decide which side to search first
-        int axis = _nodes[nodeIndex].Axis;
-        float diff = (axis == 0) ? (target.x - _positions[unitIdx].x) : (target.y - _positions[unitIdx].y);
-        
-        int first = (diff < 0) ? _nodes[nodeIndex].Left : _nodes[nodeIndex].Right;
-        int second = (diff < 0) ? _nodes[nodeIndex].Right : _nodes[nodeIndex].Left;
-
-        SearchKNN(first, target, k, best);
-
-        // Pruning: Do we need to search the other side?
-        // Only if the distance to the splitting plane is less than the distance to the worst candidate in 'best'.
-        // If 'best' is not full, we must search.
-        
-        bool shouldSearchSecond = true;
-        if (best.Count == k)
+        while (_searchStack.Count > 0)
         {
-            // 'best' is full, check if plane is within reach of the worst candidate
-            float worstDistSq = best[best.Count - 1].distSq; // List is sorted ascending? No, we need to manage that.
-            // If we use a MaxHeap, worst is at top.
-            // With List, let's assume we keep it sorted or find max.
-            // Let's keep it sorted ascending for simplicity of "nearest".
-            // So worst is at the end.
+            var job = _searchStack.Pop();
+            int nodeIndex = job.NodeIndex;
             
-            if (diff * diff >= worstDistSq)
-            {
-                shouldSearchSecond = false;
-            }
-        }
+            if (nodeIndex == -1) continue;
 
-        if (shouldSearchSecond)
-        {
-            SearchKNN(second, target, k, best);
+            // Pruning: If the closest point in this node's space is further than our worst best candidate, skip.
+            // Only applicable if we have found K candidates.
+            if (best.Count == k)
+            {
+                float worstDistSq = best[best.Count - 1].distSq;
+                if (job.MinDistSq >= worstDistSq)
+                {
+                    continue;
+                }
+            }
+
+            int unitIdx = _nodes[nodeIndex].UnitIndex;
+            float distSq = (_positions[unitIdx] - target).sqrMagnitude;
+
+            // Try to add to best
+            AddCandidate(unitIdx, distSq, k, best);
+
+            // Decide which side to search first
+            int axis = _nodes[nodeIndex].Axis;
+            float diff = (axis == 0) ? (target.x - _positions[unitIdx].x) : (target.y - _positions[unitIdx].y);
+            
+            int first = (diff < 0) ? _nodes[nodeIndex].Left : _nodes[nodeIndex].Right;
+            int second = (diff < 0) ? _nodes[nodeIndex].Right : _nodes[nodeIndex].Left;
+            
+            float diffSq = diff * diff;
+
+            // Push second (farther) child first, so it's processed last
+            // We pass diffSq as the MinDistSq for the farther child
+            if (second != -1)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = second, MinDistSq = diffSq });
+            }
+
+            // Push first (closer) child
+            // MinDistSq is 0 because we are "inside" the closer half-space (relative to this split)
+            if (first != -1)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = first, MinDistSq = 0f });
+            }
         }
     }
 
     private void AddCandidate(int index, float distSq, int k, List<(int index, float distSq)> best)
     {
         // Insert into sorted list (ascending distance)
+        // Optimization: Binary search for insertion point? 
+        // For small K (e.g. 1-10), linear scan is fast.
+        
         int insertPos = 0;
+        // Linear scan
         while (insertPos < best.Count && best[insertPos].distSq < distSq)
         {
             insertPos++;
@@ -218,32 +342,46 @@ public class KDTreeIndex : ISpatialIndex
     public void QueryRadius(Vector2 position, float radius, List<int> results)
     {
         results.Clear();
-        SearchRadius(_rootIndex, position, radius * radius, results);
-    }
+        // Iterative Radius Search
+        float radiusSq = radius * radius;
+        
+        _searchStack.Clear();
+        _searchStack.Push(new SearchJob { NodeIndex = _rootIndex, MinDistSq = 0f });
 
-    private void SearchRadius(int nodeIndex, Vector2 target, float radiusSq, List<int> results)
-    {
-        if (nodeIndex == -1) return;
-
-        int unitIdx = _nodes[nodeIndex].UnitIndex;
-        float distSq = (_positions[unitIdx] - target).sqrMagnitude;
-
-        if (distSq <= radiusSq)
+        while (_searchStack.Count > 0)
         {
-            results.Add(unitIdx);
-        }
+            var job = _searchStack.Pop();
+            int nodeIndex = job.NodeIndex;
+            
+            if (nodeIndex == -1) continue;
 
-        int axis = _nodes[nodeIndex].Axis;
-        float diff = (axis == 0) ? (target.x - _positions[unitIdx].x) : (target.y - _positions[unitIdx].y);
+            if (job.MinDistSq > radiusSq) continue;
 
-        int first = (diff < 0) ? _nodes[nodeIndex].Left : _nodes[nodeIndex].Right;
-        int second = (diff < 0) ? _nodes[nodeIndex].Right : _nodes[nodeIndex].Left;
+            int unitIdx = _nodes[nodeIndex].UnitIndex;
+            float distSq = (_positions[unitIdx] - position).sqrMagnitude;
 
-        SearchRadius(first, target, radiusSq, results);
+            if (distSq <= radiusSq)
+            {
+                results.Add(unitIdx);
+            }
 
-        if (diff * diff <= radiusSq)
-        {
-            SearchRadius(second, target, radiusSq, results);
+            int axis = _nodes[nodeIndex].Axis;
+            float diff = (axis == 0) ? (position.x - _positions[unitIdx].x) : (position.y - _positions[unitIdx].y);
+            
+            int first = (diff < 0) ? _nodes[nodeIndex].Left : _nodes[nodeIndex].Right;
+            int second = (diff < 0) ? _nodes[nodeIndex].Right : _nodes[nodeIndex].Left;
+            
+            float diffSq = diff * diff;
+
+            if (second != -1 && diffSq <= radiusSq)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = second, MinDistSq = diffSq });
+            }
+
+            if (first != -1)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = first, MinDistSq = 0f });
+            }
         }
     }
 }

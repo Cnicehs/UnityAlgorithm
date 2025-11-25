@@ -1,12 +1,16 @@
 using System.Collections.Generic;
 using UnityEngine;
+using Cysharp.Threading.Tasks;
 using System.Diagnostics;
 using Debug = UnityEngine.Debug;
 
 public enum SpatialStructureType
 {
     Grid,
-    KDTree
+    KDTree,
+    BVH,
+    QuadTree,
+    SIMDHashGrid
 }
 
 public class SpatialIndexManager : MonoBehaviour
@@ -16,6 +20,7 @@ public class SpatialIndexManager : MonoBehaviour
     public int UnitCount = 10000;
     public float WorldSize = 100f;
     public float UnitSpeed = 5f;
+    public bool UseMultiThreading = true; // Toggle for multi-threading mode
     
     [Header("Grid Settings")]
     public int GridResolution = 40; // Optimized: ~6 units per cell for 10k units
@@ -29,48 +34,52 @@ public class SpatialIndexManager : MonoBehaviour
     [Header("Performance")]
     public float BuildTimeMs;
     public float QueryTimeMs;
+    public bool IsBuilding;
+    public bool IsQuerying;
 
     private List<Unit> _units = new List<Unit>();
-    private List<Vector2> _positions = new List<Vector2>();
+    
+    // Double buffering for thread safety
+    // _mainThreadPositions: Updated by Update() for rendering/logic
+    // _asyncPositions: Copied from _mainThreadPositions for background tasks
+    private List<Vector2> _mainThreadPositions = new List<Vector2>();
+    private List<Vector2> _asyncPositions = new List<Vector2>();
+    
     private ISpatialIndex _spatialIndex;
-    private Stopwatch _stopwatch = new Stopwatch();
-
-    // Query results for visualization (just for the first unit as 'Hero')
+    
+    // Query results for visualization (Hero)
     private List<int> _heroQueryResults = new List<int>();
 
     void Start()
     {
         SpawnUnits();
+        // Start async build loop (independent background task)
+        BuildLoop().Forget();
     }
 
     void Update()
     {
-        // 1. Update Unit Positions
+        // 1. Update Unit Positions (Main Thread)
         MoveUnits();
-
-        // 2. Rebuild Index
-        RebuildIndex();
-
-        // 3. Perform Queries
-        if (PerformQueries && _units.Count > 0)
+        
+        // 2. Perform Queries (Main Thread - fast, no threading needed)
+        if (PerformQueries && _spatialIndex != null && _units.Count > 0)
         {
-            PerformDemoQueries();
+            PerformQuery();
         }
     }
 
     private void SpawnUnits()
     {
-        // Clear existing
         foreach (var unit in _units)
         {
-            Destroy(unit.gameObject);
+            if (unit != null) Destroy(unit.gameObject);
         }
         _units.Clear();
-        _positions.Clear();
+        _mainThreadPositions.Clear();
 
-        // Create template if needed, or just primitives
         GameObject template = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        Destroy(template.GetComponent<Collider>()); // Remove collider for performance
+        Destroy(template.GetComponent<Collider>());
         
         for (int i = 0; i < UnitCount; i++)
         {
@@ -85,10 +94,13 @@ public class SpatialIndexManager : MonoBehaviour
             unit.Bounds = new Rect(-WorldSize/2, -WorldSize/2, WorldSize, WorldSize);
             
             _units.Add(unit);
-            _positions.Add(pos);
+            _mainThreadPositions.Add(pos);
         }
         
         Destroy(template);
+        
+        // Initialize async buffer
+        _asyncPositions = new List<Vector2>(_mainThreadPositions);
     }
 
     private void MoveUnits()
@@ -97,78 +109,162 @@ public class SpatialIndexManager : MonoBehaviour
         for (int i = 0; i < _units.Count; i++)
         {
             _units[i].Move(dt);
-            _positions[i] = _units[i].Position;
+            _mainThreadPositions[i] = _units[i].Position;
             _units[i].transform.position = _units[i].Position;
         }
     }
 
-    private void RebuildIndex()
+    private ISpatialIndex _indexA;
+    private ISpatialIndex _indexB;
+    private bool _usingIndexA = true; // Tracks which index is currently being built/used
+    private SpatialStructureType _lastStructureType;
+    private int _lastUnitCount;
+
+    private void EnsureIndicesCreated()
     {
-        _stopwatch.Restart();
-
-        if (StructureType == SpatialStructureType.Grid)
+        // Recreate indices if settings changed or not created yet
+        if (_indexA == null || _indexB == null || 
+            _lastStructureType != StructureType || _lastUnitCount != UnitCount)
         {
-            if (_spatialIndex is not SpatialGridIndex)
-            {
-                // Create new grid
-                // Origin is bottom-left
-                Vector2 origin = new Vector2(-WorldSize/2, -WorldSize/2);
-                float cellSize = WorldSize / GridResolution;
-                _spatialIndex = new SpatialGridIndex(GridResolution, GridResolution, cellSize, origin);
-            }
+            _lastStructureType = StructureType;
+            _lastUnitCount = UnitCount;
+            
+            _indexA = CreateNewIndex();
+            _indexB = CreateNewIndex();
+            
+            // Force GC collection after large allocation change to clean up old indices
+            System.GC.Collect();
         }
-        else
-        {
-            if (_spatialIndex is not KDTreeIndex)
-            {
-                _spatialIndex = new KDTreeIndex(_units.Count);
-            }
-        }
-
-        _spatialIndex.Build(_positions);
-
-        _stopwatch.Stop();
-        BuildTimeMs = (float)_stopwatch.Elapsed.TotalMilliseconds;
     }
 
-    private void PerformDemoQueries()
+    private ISpatialIndex CreateNewIndex()
     {
-        _stopwatch.Restart();
+        switch (StructureType)
+        {
+            case SpatialStructureType.Grid:
+                return new SpatialGridIndex(GridResolution, GridResolution, WorldSize / GridResolution, new Vector2(-WorldSize/2, -WorldSize/2));
+            case SpatialStructureType.KDTree:
+                return new KDTreeIndex(UnitCount);
+            case SpatialStructureType.BVH:
+                return new BVHIndex(UnitCount);
+            case SpatialStructureType.QuadTree:
+                return new QuadTreeIndex(UnitCount, new Rect(-WorldSize/2, -WorldSize/2, WorldSize, WorldSize));
+            case SpatialStructureType.SIMDHashGrid:
+                return new SIMDHashGridIndex(GridResolution, GridResolution, WorldSize / GridResolution, new Vector2(-WorldSize/2, -WorldSize/2), UnitCount);
+            default:
+                return new KDTreeIndex(UnitCount);
+        }
+    }
 
-        // Query for the first unit (Hero)
+    private async UniTaskVoid BuildLoop()
+    {
+        while (this != null)
+        {
+            // Wait for next frame
+            await UniTask.Yield(PlayerLoopTiming.Update);
+            
+            if (_units.Count == 0) continue;
+
+            // Ensure indices exist and match current settings
+            EnsureIndicesCreated();
+
+            // Copy positions to async buffer (main thread)
+            if (_asyncPositions.Capacity < _mainThreadPositions.Count)
+            {
+                _asyncPositions.Capacity = _mainThreadPositions.Count;
+            }
+            _asyncPositions.Clear();
+            _asyncPositions.AddRange(_mainThreadPositions);
+
+            // Build index
+            IsBuilding = true;
+            
+            // Pick the "back buffer" index to build
+            // If _spatialIndex is currently _indexA, we build _indexB, and vice versa.
+            // Actually, let's just track which one is "active" for query, and build the other.
+            ISpatialIndex indexToBuild = _usingIndexA ? _indexB : _indexA;
+            
+            float buildTime = 0;
+            
+            if (UseMultiThreading)
+            {
+                // Multi-threaded build (background thread)
+                await UniTask.RunOnThreadPool(async () =>
+                {
+                    Stopwatch sw = Stopwatch.StartNew();
+                    await indexToBuild.BuildAsync(_asyncPositions);
+                    sw.Stop();
+                    buildTime = (float)sw.Elapsed.TotalMilliseconds;
+                });
+            }
+            else
+            {
+                // Single-threaded build (main thread)
+                Stopwatch sw = Stopwatch.StartNew();
+                await indexToBuild.BuildAsync(_asyncPositions);
+                sw.Stop();
+                buildTime = (float)sw.Elapsed.TotalMilliseconds;
+            }
+            
+            BuildTimeMs = buildTime;
+            IsBuilding = false;
+
+            // Swap buffers
+            _usingIndexA = !_usingIndexA;
+            _spatialIndex = indexToBuild;
+        }
+    }
+
+    private void PerformQuery()
+    {
+        if (_spatialIndex == null) return;
+
+        Stopwatch sw = Stopwatch.StartNew();
+        
         _heroQueryResults.Clear();
-        _spatialIndex.QueryKNearest(_positions[0], QueryK, _heroQueryResults);
-
-        _stopwatch.Stop();
-        QueryTimeMs = (float)_stopwatch.Elapsed.TotalMilliseconds;
+        Vector2 heroPos = _mainThreadPositions[0];
+        
+        _spatialIndex.QueryKNearest(heroPos, QueryK, _heroQueryResults);
+        
+        sw.Stop();
+        QueryTimeMs = (float)sw.Elapsed.TotalMilliseconds;
     }
+
 
     private void OnGUI()
     {
-        GUILayout.BeginArea(new Rect(10, 10, 300, 200));
+        GUILayout.BeginArea(new Rect(10, 10, 300, 250));
         GUILayout.Label($"Units: {UnitCount}");
         GUILayout.Label($"Structure: {StructureType}");
-        GUILayout.Label($"Build Time: {BuildTimeMs:F2} ms");
-        GUILayout.Label($"Query Time (1 unit): {QueryTimeMs:F4} ms");
-        GUILayout.Label($"FPS: {1.0f/Time.deltaTime:F1}");
+        GUILayout.Label($"Multi-Threading: {(UseMultiThreading ? "ON" : "OFF")}");
+        GUILayout.Label($"Build Time: {BuildTimeMs:F2} ms {(IsBuilding ? "(Building...)" : "")}");
+        GUILayout.Label($"Query Time (Hero): {QueryTimeMs:F4} ms {(IsQuerying ? "(Querying...)" : "")}");
+        GUILayout.Label($"FPS: {1.0f/Time.smoothDeltaTime:F1}");
         GUILayout.EndArea();
     }
 
     private void OnDrawGizmos()
     {
-        if (!ShowGizmos || _units.Count == 0 || _heroQueryResults.Count == 0) return;
+        if (!ShowGizmos || _units.Count == 0 || _heroQueryResults == null) return;
 
         // Draw Hero
         Gizmos.color = Color.green;
-        Vector3 heroPos = _units[0].Position;
-        Gizmos.DrawWireSphere(heroPos, 1f);
-
-        // Draw Lines to Neighbors
-        Gizmos.color = Color.red;
-        foreach (int idx in _heroQueryResults)
+        // Use main thread positions for rendering
+        if (_mainThreadPositions.Count > 0)
         {
-            Gizmos.DrawLine(heroPos, _units[idx].Position);
-            Gizmos.DrawWireSphere(_units[idx].Position, 0.5f);
+            Vector3 heroPos = _mainThreadPositions[0];
+            Gizmos.DrawWireSphere(heroPos, 1f);
+
+            // Draw Lines to Neighbors
+            Gizmos.color = Color.red;
+            foreach (int idx in _heroQueryResults)
+            {
+                if (idx < _mainThreadPositions.Count)
+                {
+                    Gizmos.DrawLine(heroPos, _mainThreadPositions[idx]);
+                    Gizmos.DrawWireSphere(_mainThreadPositions[idx], 0.5f);
+                }
+            }
         }
     }
 }

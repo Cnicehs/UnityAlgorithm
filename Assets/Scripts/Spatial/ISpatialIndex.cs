@@ -1,13 +1,14 @@
 using System.Collections.Generic;
 using UnityEngine;
+using Cysharp.Threading.Tasks;
 
 public interface ISpatialIndex
 {
     /// <summary>
-    /// Rebuilds the index with the given positions.
+    /// Rebuilds the index with the given positions asynchronously.
     /// </summary>
     /// <param name="positions">List of positions to index.</param>
-    void Build(List<Vector2> positions);
+    UniTask BuildAsync(List<Vector2> positions);
 
     /// <summary>
     /// Finds the K nearest neighbors to the query position.
