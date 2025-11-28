@@ -5,11 +5,6 @@ using System.Diagnostics;
 using Debug = UnityEngine.Debug;
 using System;
 using Random = UnityEngine.Random;
-using System.Collections.Generic;
-using UnityEngine;
-using Cysharp.Threading.Tasks;
-using System.Diagnostics;
-using System;
 
 public enum SpatialStructureType
 {
@@ -35,18 +30,18 @@ public class SpatialIndexManager
     public bool IsBuilding { get; private set; }
 
     private int _unitCount;
-    private float _worldSize;
+private float _worldSize;
     
     // Double buffering
     private List<Vector2> _mainThreadPositions = new List<Vector2>();
     private List<Vector2> _asyncPositionsA = new List<Vector2>();
     private List<Vector2> _asyncPositionsB = new List<Vector2>();
-    
+
     private ISpatialIndex _spatialIndex;
     private ISpatialIndex _indexA;
     private ISpatialIndex _indexB;
     private bool _usingIndexA = true;
-    
+
     private SpatialStructureType _lastStructureType;
     private int _lastUnitCount;
     
@@ -54,7 +49,7 @@ public class SpatialIndexManager
 
     private SpatialIndexManager()
     {
-        // Private constructor
+    // Private constructor
     }
 
     public void Initialize(int unitCount, float worldSize)
@@ -107,13 +102,13 @@ public class SpatialIndexManager
             (_indexB as IDisposable)?.Dispose();
 
             _indexA = CreateNewIndex();
-            _indexB = CreateNewIndex();
+_indexB = CreateNewIndex();
             
             System.GC.Collect();
         }
     }
 
-    private ISpatialIndex CreateNewIndex()
+ISpatialIndex CreateNewIndex()
     {
         switch (StructureType)
         {
@@ -137,7 +132,6 @@ public class SpatialIndexManager
                 return new KDTreeIndex(_unitCount);
         }
     }
-
     private async UniTaskVoid BuildLoop()
     {
         while (_isRunning)
@@ -148,7 +142,7 @@ public class SpatialIndexManager
 
             EnsureIndicesCreated();
 
-            ISpatialIndex indexToBuild = _usingIndexA ? _indexB : _indexA;
+ISpatialIndex indexToBuild = _usingIndexA ? _indexB : _indexA;
             List<Vector2> currentAsyncPositions = _usingIndexA ? _asyncPositionsB : _asyncPositionsA;
 
             if (currentAsyncPositions.Capacity < _mainThreadPositions.Count)
@@ -165,7 +159,7 @@ public class SpatialIndexManager
             {
                 await UniTask.RunOnThreadPool(async () =>
                 {
-                    Stopwatch sw = Stopwatch.StartNew();
+        Stopwatch sw = Stopwatch.StartNew();
                     await indexToBuild.BuildAsync(currentAsyncPositions);
                     sw.Stop();
                     buildTime = (float)sw.Elapsed.TotalMilliseconds;
@@ -183,7 +177,7 @@ public class SpatialIndexManager
             IsBuilding = false;
 
             _usingIndexA = !_usingIndexA;
-            _spatialIndex = indexToBuild;
+_spatialIndex = indexToBuild;
         }
     }
 }

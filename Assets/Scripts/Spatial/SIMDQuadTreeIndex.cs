@@ -7,6 +7,7 @@ using Unity.Mathematics;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 
+[BurstCompile]
 public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 {
     private struct Node
@@ -25,26 +26,13 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     private NativeArray<int> _unitIndices;
     private int _nodeCount;
     private int _rootIndex;
-    
+
     private List<Vector2> _positions;
     private int _count;
     private Rect _bounds;
 
-    private static readonly SharedStatic<FunctionPointer<BuildDelegate>> _buildFP = SharedStatic<FunctionPointer<BuildDelegate>>.GetOrCreate<SIMDQuadTreeIndex, FunctionPointer<BuildDelegate>>();
-    private static readonly SharedStatic<FunctionPointer<QueryKNearestDelegate>> _queryKNearestFP = SharedStatic<FunctionPointer<QueryKNearestDelegate>>.GetOrCreate<SIMDQuadTreeIndex, FunctionPointer<QueryKNearestDelegate>>();
-    private static readonly SharedStatic<FunctionPointer<QueryRadiusDelegate>> _queryRadiusFP = SharedStatic<FunctionPointer<QueryRadiusDelegate>>.GetOrCreate<SIMDQuadTreeIndex, FunctionPointer<QueryRadiusDelegate>>();
 
-    private delegate void BuildDelegate(Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int count, int* nodeCount, float4 bounds, int maxDepth, int bucketSize);
-    private delegate void QueryKNearestDelegate(float2 position, int k, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults);
-    private delegate void QueryRadiusDelegate(float2 position, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults);
 
-    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-    private static void Init()
-    {
-        if (!_buildFP.Data.IsCreated) _buildFP.Data = BurstCompiler.CompileFunctionPointer<BuildDelegate>(BuildBurst);
-        if (!_queryKNearestFP.Data.IsCreated) _queryKNearestFP.Data = BurstCompiler.CompileFunctionPointer<QueryKNearestDelegate>(QueryKNearestBurst);
-        if (!_queryRadiusFP.Data.IsCreated) _queryRadiusFP.Data = BurstCompiler.CompileFunctionPointer<QueryRadiusDelegate>(QueryRadiusBurst);
-    }
 
     public SIMDQuadTreeIndex(int capacity, Rect bounds)
     {
@@ -52,7 +40,6 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         _linkedUnits = new NativeArray<int>(capacity, Allocator.Persistent);
         _unitIndices = new NativeArray<int>(capacity, Allocator.Persistent);
         _bounds = bounds;
-        if (!_buildFP.Data.IsCreated) Init();
     }
 
     public void Dispose()
@@ -83,7 +70,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             fixed (int* nodeCountPtr = &_nodeCount)
             {
                 float4 b = new float4(_bounds.x, _bounds.y, _bounds.width, _bounds.height);
-                _buildFP.Data.Invoke((Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _count, nodeCountPtr, b, 8, 16);
+                BuildBurst((Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _count, nodeCountPtr, b, 8, 16);
             }
         }
         _rootIndex = 0;
@@ -92,15 +79,22 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void BuildBurst(Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int count, int* nodeCount, float4 bounds, int maxDepth, int bucketSize)
+    private static void BuildBurst(Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int count, int* nodeCount, in float4 bounds, int maxDepth, int bucketSize)
     {
         *nodeCount = 0;
         int rootIndex = (*nodeCount)++;
-        nodes[rootIndex] = new Node 
-        { 
-            X = bounds.x, Y = bounds.y, W = bounds.z, H = bounds.w,
-            Child0 = -1, Child1 = -1, Child2 = -1, Child3 = -1,
-            FirstUnit = -1, Count = 0 
+        nodes[rootIndex] = new Node
+        {
+            X = bounds.x,
+            Y = bounds.y,
+            W = bounds.z,
+            H = bounds.w,
+            Child0 = -1,
+            Child1 = -1,
+            Child2 = -1,
+            Child3 = -1,
+            FirstUnit = -1,
+            Count = 0
         };
 
         for (int i = 0; i < count; i++)
@@ -109,7 +103,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         }
     }
 
-    private static void Insert(int unitIdx, float2 pos, Node* nodes, int* linkedUnits, int* unitIndices, int* nodeCount, int maxDepth, int bucketSize, float2* positions)
+    private static void Insert(int unitIdx, in float2 pos, Node* nodes, int* linkedUnits, int* unitIndices, int* nodeCount, int maxDepth, int bucketSize, float2* positions)
     {
         int current = 0; // Root
         int depth = 0;
@@ -136,7 +130,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             // Find child
             float midX = nodes[current].X + nodes[current].W * 0.5f;
             float midY = nodes[current].Y + nodes[current].H * 0.5f;
-            
+
             int childIdx = 0;
             if (pos.x > midX) childIdx += 1;
             if (pos.y > midY) childIdx += 2;
@@ -149,7 +143,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
                 case 2: nextNode = nodes[current].Child2; break;
                 case 3: nextNode = nodes[current].Child3; break;
             }
-            
+
             current = nextNode;
             depth++;
         }
@@ -169,10 +163,10 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         int c2 = (*nodeCount)++;
         int c3 = (*nodeCount)++;
 
-        nodes[c0] = new Node { X = x, Y = y, W = w, H = h, Child0=-1, Child1=-1, Child2=-1, Child3=-1, FirstUnit=-1 };
-        nodes[c1] = new Node { X = x+w, Y = y, W = w, H = h, Child0=-1, Child1=-1, Child2=-1, Child3=-1, FirstUnit=-1 };
-        nodes[c2] = new Node { X = x, Y = y+h, W = w, H = h, Child0=-1, Child1=-1, Child2=-1, Child3=-1, FirstUnit=-1 };
-        nodes[c3] = new Node { X = x+w, Y = y+h, W = w, H = h, Child0=-1, Child1=-1, Child2=-1, Child3=-1, FirstUnit=-1 };
+        nodes[c0] = new Node { X = x, Y = y, W = w, H = h, Child0 = -1, Child1 = -1, Child2 = -1, Child3 = -1, FirstUnit = -1 };
+        nodes[c1] = new Node { X = x + w, Y = y, W = w, H = h, Child0 = -1, Child1 = -1, Child2 = -1, Child3 = -1, FirstUnit = -1 };
+        nodes[c2] = new Node { X = x, Y = y + h, W = w, H = h, Child0 = -1, Child1 = -1, Child2 = -1, Child3 = -1, FirstUnit = -1 };
+        nodes[c3] = new Node { X = x + w, Y = y + h, W = w, H = h, Child0 = -1, Child1 = -1, Child2 = -1, Child3 = -1, FirstUnit = -1 };
 
         nodes[nodeIdx].Child0 = c0;
         nodes[nodeIdx].Child1 = c1;
@@ -184,7 +178,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         {
             int nextUnit = linkedUnits[currUnit];
             float2 pos = positions[currUnit]; // We need positions here!
-            
+
             int child = 0;
             if (pos.x > x + w) child += 1;
             if (pos.y > y + h) child += 2;
@@ -225,7 +219,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                _queryKNearestFP.Data.Invoke(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -243,7 +237,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(float2 position, int k, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         Candidate* candidates = (Candidate*)UnsafeUtility.Malloc(maxResults * sizeof(Candidate), 4, Allocator.Temp);
         int candidateCount = 0;
@@ -340,7 +334,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                _queryRadiusFP.Data.Invoke(new float2(position.x, position.y), radius * radius, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxResults);
+                QueryRadiusBurst(new float2(position.x, position.y), radius * radius, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxResults);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -351,7 +345,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryRadiusBurst(float2 position, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryRadiusBurst(in float2 position, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         float radius = math.sqrt(radiusSq);
         int* stack = stackalloc int[64];

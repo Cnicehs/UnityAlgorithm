@@ -38,14 +38,13 @@ public static unsafe class SIMDAlgorithms
         float2 t = target;
         fixed (Vector2* ptr = span)
         {
-            return FindNearestBurst((float2*)ptr, points.Count, &t);
+            return FindNearestBurst((float2*)ptr, points.Count, in t);
         }
     }
 
     [BurstCompile]
-    private static int FindNearestBurst(float2* points, int count, float2* targetPtr)
+    private static int FindNearestBurst(float2* points, int count, in float2 target)
     {
-        float2 target = *targetPtr;
         float4 target4 = new float4(target.x, target.y, target.x, target.y);
         
         float4 minDists = new float4(float.MaxValue);
@@ -110,15 +109,14 @@ public static unsafe class SIMDAlgorithms
         float2 t = target;
         fixed (Vector2* ptr = span)
         {
-            return FindClosestIndex_SerialSIMD_Strict((float2*)ptr, points.Count, &t);
+            return FindClosestIndex_SerialSIMD_Strict((float2*)ptr, points.Count, in t);
         }
     }
 
     [BurstCompile]
-    private static unsafe int FindClosestIndex_SerialSIMD_Strict(float2* pointsPtr, int count, float2* targetPtr)
+    private static unsafe int FindClosestIndex_SerialSIMD_Strict(float2* pointsPtr, int count, in float2 pointB)
     {
         if (count == 0) return -1;
-        float2 pointB = *targetPtr;
 
         // --- 初始化 SIMD 常量 ---
         var bX = new float4(pointB.x);
@@ -252,7 +250,7 @@ public static unsafe class SIMDAlgorithms
             Span<Vector2> span = points.AsSpan();
             fixed (Vector2* ptr = span)
             {
-                FindInRadiusBurst((float2*)ptr, count, &t, radius * radius, resultBuffer, &resultCount, count);
+                FindInRadiusBurst((float2*)ptr, count, in t, radius * radius, resultBuffer, &resultCount, count);
             }
 
             // Copy back
@@ -277,9 +275,8 @@ public static unsafe class SIMDAlgorithms
     }
 
     [BurstCompile]
-    private static void FindInRadiusBurst(float2* points, int count, float2* targetPtr, float radiusSq, int* results, int* resultCount, int maxResults)
+    private static void FindInRadiusBurst(float2* points, int count, in float2 target, float radiusSq, int* results, int* resultCount, int maxResults)
     {
-        float2 target = *targetPtr;
         int found = 0;
         int i = 0;
 
@@ -349,18 +346,18 @@ public static unsafe class SIMDAlgorithms
     {
         if (points.Count == 0) return new Rect();
 
-        float4 result;
+        float4 result = default;
         Span<Vector2> span = points.AsSpan();
         fixed (Vector2* ptr = span)
         {
-            CalculateBoundsBurst((float2*)ptr, points.Count, &result);
+            CalculateBoundsBurst((float2*)ptr, points.Count, ref result);
         }
 
         return new Rect(result.x, result.y, result.z - result.x, result.w - result.y);
     }
 
     [BurstCompile]
-    private static void CalculateBoundsBurst(float2* points, int count, float4* resultPtr)
+    private static void CalculateBoundsBurst(float2* points, int count, ref float4 result)
     {
         float4 minX_vec = new float4(float.MaxValue);
         float4 minY_vec = new float4(float.MaxValue);
@@ -398,7 +395,7 @@ public static unsafe class SIMDAlgorithms
             maxY = math.max(maxY, p.y);
         }
 
-        *resultPtr = new float4(minX, minY, maxX, maxY);
+        result = new float4(minX, minY, maxX, maxY);
     }
 
     // -----------------------------------------------------------------------------------
@@ -415,16 +412,16 @@ public static unsafe class SIMDAlgorithms
     public static Vector2 SumBurst(List<Vector2> points)
     {
         Span<Vector2> span = points.AsSpan();
-        float2 result;
+        float2 result = default;
         fixed (Vector2* ptr = span)
         {
-            SumBurst((float2*)ptr, points.Count, &result);
+            SumBurst((float2*)ptr, points.Count, ref result);
         }
         return result;
     }
 
     [BurstCompile]
-    private static void SumBurst(float2* points, int count, float2* resultPtr)
+    private static void SumBurst(float2* points, int count, ref float2 result)
     {
         float2 sum = float2.zero;
         int i = 0;
@@ -451,7 +448,7 @@ public static unsafe class SIMDAlgorithms
         {
             sum += points[i];
         }
-        *resultPtr = sum;
+        result = sum;
     }
 
     public static Vector2 AverageLegacy(List<Vector2> points)
@@ -484,14 +481,13 @@ public static unsafe class SIMDAlgorithms
         float2 t = translation;
         fixed (Vector2* ptr = span)
         {
-            TranslateBurst((float2*)ptr, points.Count, &t);
+            TranslateBurst((float2*)ptr, points.Count, in t);
         }
     }
 
     [BurstCompile]
-    private static void TranslateBurst(float2* points, int count, float2* translationPtr)
+    private static void TranslateBurst(float2* points, int count, in float2 translation)
     {
-        float2 translation = *translationPtr;
         float4 t4 = new float4(translation.x, translation.y, translation.x, translation.y);
         
         int i = 0;
@@ -582,7 +578,7 @@ public static unsafe class SIMDAlgorithms
             Span<Vector2> span = points.AsSpan();
             fixed (Vector2* ptr = span)
             {
-                BatchDotBurst((float2*)ptr, count, &t, resultBuffer);
+                BatchDotBurst((float2*)ptr, count, in t, resultBuffer);
             }
 
             for (int i = 0; i < count; i++)
@@ -597,9 +593,8 @@ public static unsafe class SIMDAlgorithms
     }
 
     [BurstCompile]
-    private static void BatchDotBurst(float2* points, int count, float2* targetPtr, float* results)
+    private static void BatchDotBurst(float2* points, int count, in float2 target, float* results)
     {
-        float2 target = *targetPtr;
         float4 target4 = new float4(target.x, target.y, target.x, target.y);
         
         int i = 0;

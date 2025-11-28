@@ -7,6 +7,7 @@ using Unity.Mathematics;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 
+[BurstCompile]
 public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 {
     private struct Node
@@ -25,28 +26,12 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
     private List<Vector2> _positions;
     private int _count;
 
-    // Function Pointers
-    private static readonly SharedStatic<FunctionPointer<BuildDelegate>> _buildFP = SharedStatic<FunctionPointer<BuildDelegate>>.GetOrCreate<SIMDKDTreeIndex, FunctionPointer<BuildDelegate>>();
-    private static readonly SharedStatic<FunctionPointer<QueryKNearestDelegate>> _queryKNearestFP = SharedStatic<FunctionPointer<QueryKNearestDelegate>>.GetOrCreate<SIMDKDTreeIndex, FunctionPointer<QueryKNearestDelegate>>();
-    private static readonly SharedStatic<FunctionPointer<QueryRadiusDelegate>> _queryRadiusFP = SharedStatic<FunctionPointer<QueryRadiusDelegate>>.GetOrCreate<SIMDKDTreeIndex, FunctionPointer<QueryRadiusDelegate>>();
 
-    private delegate int BuildDelegate(Node* nodes, int* indices, float2* positions, int count);
-    private delegate void QueryKNearestDelegate(float2 position, int k, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults);
-    private delegate void QueryRadiusDelegate(float2 position, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults);
-
-    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-    private static void Init()
-    {
-        if (!_buildFP.Data.IsCreated) _buildFP.Data = BurstCompiler.CompileFunctionPointer<BuildDelegate>(BuildBurst);
-        if (!_queryKNearestFP.Data.IsCreated) _queryKNearestFP.Data = BurstCompiler.CompileFunctionPointer<QueryKNearestDelegate>(QueryKNearestBurst);
-        if (!_queryRadiusFP.Data.IsCreated) _queryRadiusFP.Data = BurstCompiler.CompileFunctionPointer<QueryRadiusDelegate>(QueryRadiusBurst);
-    }
 
     public SIMDKDTreeIndex(int capacity)
     {
         _nodes = new NativeArray<Node>(capacity, Allocator.Persistent);
         _indicesBuffer = new NativeArray<int>(capacity, Allocator.Persistent);
-        if (!_buildFP.Data.IsCreated) Init();
     }
 
     public void Dispose()
@@ -71,7 +56,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
         Span<Vector2> posSpan = _positions.AsSpan();
         fixed (Vector2* posPtr = posSpan)
         {
-            _rootIndex = _buildFP.Data.Invoke((Node*)_nodes.GetUnsafePtr(), (int*)_indicesBuffer.GetUnsafePtr(), (float2*)posPtr, _count);
+            _rootIndex = BuildBurst((Node*)_nodes.GetUnsafePtr(), (int*)_indicesBuffer.GetUnsafePtr(), (float2*)posPtr, _count);
         }
 
         return UniTask.CompletedTask;
@@ -210,7 +195,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                _queryKNearestFP.Data.Invoke(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
             }
 
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
@@ -235,7 +220,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(float2 position, int k, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         if (rootIndex == -1) return;
 
@@ -347,7 +332,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                _queryRadiusFP.Data.Invoke(new float2(position.x, position.y), radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxResults);
+                QueryRadiusBurst(new float2(position.x, position.y), radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxResults);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -358,7 +343,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryRadiusBurst(float2 position, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryRadiusBurst(in float2 position, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         if (rootIndex == -1) return;
 
