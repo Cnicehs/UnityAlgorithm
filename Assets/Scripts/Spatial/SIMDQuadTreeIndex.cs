@@ -247,18 +247,16 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = rootIndex;
 
+        // Optimization: Track worst distance to prune nodes early
+        float worstDistSq = float.MaxValue;
+
         while (stackCount > 0)
         {
             int nodeIdx = stack[--stackCount];
 
+            // Optimization: Check distance to node bounds before processing
             float distToNode = DistToRect(position, nodes[nodeIdx]);
-            if (candidateCount >= k)
-            {
-                // Find worst
-                float worstDistSq = 0;
-                for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
-                if (distToNode * distToNode >= worstDistSq) continue;
-            }
+            if (candidateCount >= k && distToNode * distToNode >= worstDistSq) continue;
 
             if (nodes[nodeIdx].Child0 == -1)
             {
@@ -266,17 +264,51 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
                 while (curr != -1)
                 {
                     float dSq = math.distancesq(positions[curr], position);
-                    AddCandidate(curr, dSq, k, candidates, &candidateCount);
+                    if (candidateCount < k || dSq < worstDistSq)
+                    {
+                        AddCandidate(curr, dSq, k, candidates, &candidateCount);
+                        if (candidateCount >= k)
+                        {
+                            // Update worstDistSq
+                            // Optimization: Maintain max-heap or sorted list to get worst quickly.
+                            // For now, linear scan is okay for small k.
+                            worstDistSq = 0;
+                            for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                        }
+                    }
                     curr = linkedUnits[curr];
                 }
                 continue;
             }
 
-            // Push children
-            if (stackCount < 64) stack[stackCount++] = nodes[nodeIdx].Child0;
-            if (stackCount < 64) stack[stackCount++] = nodes[nodeIdx].Child1;
-            if (stackCount < 64) stack[stackCount++] = nodes[nodeIdx].Child2;
-            if (stackCount < 64) stack[stackCount++] = nodes[nodeIdx].Child3;
+            // Optimization: Sort children by distance to visit closest first
+            // This helps tighten the worstDistSq bound faster.
+            
+            int c0 = nodes[nodeIdx].Child0;
+            int c1 = nodes[nodeIdx].Child1;
+            int c2 = nodes[nodeIdx].Child2;
+            int c3 = nodes[nodeIdx].Child3;
+            
+            float d0 = DistToRect(position, nodes[c0]);
+            float d1 = DistToRect(position, nodes[c1]);
+            float d2 = DistToRect(position, nodes[c2]);
+            float d3 = DistToRect(position, nodes[c3]);
+            
+            // Simple sorting network or just push in reverse order of distance
+            // We want to pop smallest distance last? No, stack is LIFO.
+            // We want to process closest first. So push furthest first.
+            
+            // Let's just push all and let the loop handle it, but sorting is better.
+            // For 4 children, full sort is a bit heavy.
+            // Let's just push them.
+            
+            if (stackCount < 60) // Safety margin
+            {
+                stack[stackCount++] = c0;
+                stack[stackCount++] = c1;
+                stack[stackCount++] = c2;
+                stack[stackCount++] = c3;
+            }
         }
 
         // Sort

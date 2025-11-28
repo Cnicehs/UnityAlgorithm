@@ -232,6 +232,9 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = new SearchJob { NodeIndex = rootIndex, MinDistSq = 0 };
 
+        // Optimization: Track worst distance to prune nodes early
+        float worstDistSq = float.MaxValue;
+
         while (stackCount > 0)
         {
             SearchJob job = stack[--stackCount];
@@ -239,18 +242,22 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
             if (nodeIdx == -1) continue;
 
-            if (candidateCount >= k)
-            {
-                // Find worst
-                float worstDistSq = 0;
-                for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
-                if (job.MinDistSq >= worstDistSq) continue;
-            }
+            // Optimization: Pruning
+            if (candidateCount >= k && job.MinDistSq >= worstDistSq) continue;
 
             if (nodes[nodeIdx].UnitIndex != -1)
             {
                 float dSq = math.distancesq(positions[nodes[nodeIdx].UnitIndex], position);
-                AddCandidate(nodes[nodeIdx].UnitIndex, dSq, k, candidates, &candidateCount);
+                if (candidateCount < k || dSq < worstDistSq)
+                {
+                    AddCandidate(nodes[nodeIdx].UnitIndex, dSq, k, candidates, &candidateCount);
+                    if (candidateCount >= k)
+                    {
+                        // Update worstDistSq
+                        worstDistSq = 0;
+                        for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                    }
+                }
                 continue;
             }
 

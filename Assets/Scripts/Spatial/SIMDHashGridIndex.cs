@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using UnityEngine;
 using Cysharp.Threading.Tasks;
 using Unity.Burst;
@@ -15,18 +16,11 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     private float _cellSize;
     private float2 _origin;
 
-    // Grid - using native arrays for Burst compatibility if we wanted, 
-    // but user asked to use native C# structures where possible, 
-    // BUT to use Burst we need to pass pointers. 
-    // So we will keep int[] but pin them or get pointers when calling Burst.
-    private int[] _gridHead;
-    private int[] _next;
-
-    private List<Vector2> _positions; // Reference to the list
+    private NativeArray<int> _cellStart;
+    private NativeArray<int> _cellCount;
+    private NativeArray<float2> _sortedPositions;
+    private NativeArray<int> _originalIndices;
     private int _count;
-
-    // Cache
-    private List<(int index, float distSq)> _candidateCache = new List<(int index, float distSq)>();
 
 
 
@@ -38,46 +32,61 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         _cellSize = cellSize;
         _origin = new float2(origin.x, origin.y);
 
-        _gridHead = new int[_width * _height];
-        _next = new int[capacity];
+        _cellStart = new NativeArray<int>(_width * _height, Allocator.Persistent);
+        _cellCount = new NativeArray<int>(_width * _height, Allocator.Persistent);
+        _sortedPositions = new NativeArray<float2>(capacity, Allocator.Persistent);
+        _originalIndices = new NativeArray<int>(capacity, Allocator.Persistent);
     }
 
     public void Dispose()
     {
-        // Nothing unmanaged to dispose, arrays are managed
+        if (_cellStart.IsCreated) _cellStart.Dispose();
+        if (_cellCount.IsCreated) _cellCount.Dispose();
+        if (_sortedPositions.IsCreated) _sortedPositions.Dispose();
+        if (_originalIndices.IsCreated) _originalIndices.Dispose();
     }
 
     public UniTask BuildAsync(List<Vector2> positions)
     {
-        _positions = positions;
         _count = positions.Count;
 
-        if (_next.Length < _count)
+        if (_sortedPositions.Length < _count)
         {
-            _next = new int[_count];
+            _sortedPositions.Dispose();
+            _originalIndices.Dispose();
+            _sortedPositions = new NativeArray<float2>(_count, Allocator.Persistent);
+            _originalIndices = new NativeArray<int>(_count, Allocator.Persistent);
         }
 
-        // 1. Clear Grid
-        Array.Fill(_gridHead, -1);
-
-        // 2. Build Grid using Burst
-        // Get pointers
-        fixed (int* gridHeadPtr = _gridHead)
-        fixed (int* nextPtr = _next)
+        // 1. Count elements per cell
+        _cellCount.AsSpan().Clear();
+        int* cellCounts = (int*)_cellCount.GetUnsafePtr();
+        Span<Vector2> posSpan = positions.AsSpan();
+        fixed (Vector2* posPtr = posSpan)
         {
-            // Access List<T> internal array via ListUtils
-            Span<Vector2> posSpan = _positions.AsSpan();
-            fixed (Vector2* posPtr = posSpan)
-            {
-                BuildGridBurst(gridHeadPtr, nextPtr, (float2*)posPtr, _count, _width, _height, _cellSize, _origin);
-            }
+            CountElementsPerCell(cellCounts, (float2*)posPtr, _count, _width, _height, _cellSize, _origin);
+        }
+
+        // 2. Calculate start index for each cell (prefix sum)
+        int sum = 0;
+        for (int i = 0; i < _cellStart.Length; i++)
+        {
+            _cellStart[i] = sum;
+            sum += _cellCount[i];
+        }
+
+        // 3. Reorder positions and indices
+        int* cellStarts = (int*)_cellStart.GetUnsafePtr();
+        fixed (Vector2* posPtr = posSpan)
+        {
+            Reorder(cellStarts, (float2*)posPtr, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), _count, _width, _height, _cellSize, _origin);
         }
 
         return UniTask.CompletedTask;
     }
 
     [BurstCompile]
-    private static void BuildGridBurst(int* gridHead, int* next, float2* positions, int count, int width, int height, float cellSize, in float2 origin)
+    private static void CountElementsPerCell(int* cellCounts, float2* positions, int count, int width, int height, float cellSize, in float2 origin)
     {
         for (int i = 0; i < count; i++)
         {
@@ -89,56 +98,47 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
             if (y < 0) y = 0; else if (y >= height) y = height - 1;
 
             int cellIndex = y * width + x;
+            cellCounts[cellIndex]++;
+        }
+    }
 
-            next[i] = gridHead[cellIndex];
-            gridHead[cellIndex] = i;
+    [BurstCompile]
+    private static void Reorder(int* cellStarts, float2* positions, float2* sortedPositions, int* originalIndices, int count, int width, int height, float cellSize, in float2 origin)
+    {
+        // This needs to be a copy of cellStarts to use as a counter
+        int* cellIndices = stackalloc int[width * height];
+        UnsafeUtility.MemCpy(cellIndices, cellStarts, width * height * sizeof(int));
+
+        for (int i = 0; i < count; i++)
+        {
+            float2 p = positions[i];
+            int x = (int)((p.x - origin.x) / cellSize);
+            int y = (int)((p.y - origin.y) / cellSize);
+
+            if (x < 0) x = 0; else if (x >= width) x = width - 1;
+            if (y < 0) y = 0; else if (y >= height) y = height - 1;
+
+            int cellIndex = y * width + x;
+            int sortedIndex = cellIndices[cellIndex]++;
+            
+            sortedPositions[sortedIndex] = p;
+            originalIndices[sortedIndex] = i;
         }
     }
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
         results.Clear();
-
-        // We need a temporary buffer for results from Burst
-        // Since we can't easily pass List<int> to Burst to Add()
-        // We'll use a stackalloc buffer if k is small, or a NativeArray if large.
-        // Assuming k is relatively small for KNN.
-
-        // However, KNN with rings is complex to fully burstify in one go without a scratchpad.
-        // The user wants "SIMD version", "Burst compiled".
-        // A full KNN search in Burst requires managing the candidate list.
-
-        // Let's allocate a temporary buffer for candidates.
-        // Max candidates? Hard to know.
-        // But wait, the previous implementation gathered candidates then sorted.
-        // We can do the same in Burst.
-
-        int maxCandidates = k * 10; // Heuristic
+        int maxCandidates = k * 10;
         if (maxCandidates < 128) maxCandidates = 128;
-
-        // We'll use a native array for the results to pass to burst
-        // Or just stackalloc if we are on the main thread and k is small.
-        // But k is dynamic.
-
-        // Let's use a pooled array or just a temporary NativeArray.
-        // Since we are not using Job System, we can just use UnsafeUtility.Malloc
 
         int* resultBuffer = (int*)UnsafeUtility.Malloc(maxCandidates * sizeof(int), 4, Allocator.Temp);
         int resultCount = 0;
 
         try
         {
-            fixed (int* gridHeadPtr = _gridHead)
-            fixed (int* nextPtr = _next)
-            {
-                Span<Vector2> posSpan = _positions.AsSpan();
-                fixed (Vector2* posPtr = posSpan)
-                {
-                    QueryKNearestBurst(new float2(position.x, position.y), k, (float2*)posPtr, gridHeadPtr, nextPtr, _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxCandidates);
-                }
-            }
+            QueryKNearestBurst(new float2(position.x, position.y), k, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxCandidates);
 
-            // Copy back
             for (int i = 0; i < resultCount; i++)
             {
                 results.Add(resultBuffer[i]);
@@ -163,15 +163,8 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, float2* positions, int* gridHead, int* next, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
     {
-        // We need a local cache for candidates
-        // Since we can't allocate managed objects, we use stackalloc or UnsafeUtility
-        // But we are inside a function pointer, so we should be careful with allocations.
-        // We can use a fixed size buffer on stack if small, or just iterate.
-
-        // Implementation of the ring search in Burst
-
         int startX = (int)((position.x - origin.x) / cellSize);
         int startY = (int)((position.y - origin.y) / cellSize);
 
@@ -181,72 +174,76 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         int searchRadius = 0;
         int maxSearchRadius = math.max(width, height);
 
-        // We need to store candidates (index, distSq)
-        // We can't use List. We'll use a raw pointer buffer.
-        // We'll reuse the 'results' buffer for indices, but we need dists too.
-        // Actually, let's just find the best K.
-        // A simple MinHeap or just gathering and sorting at the end.
-        // For simplicity and SIMD-friendliness (batching), gathering is good.
-
-        // We need a scratch buffer for candidates. 
-        // Let's assume maxResults is enough for our candidates.
-
-        // Allocate temporary memory for candidates (Index, DistSq)
-        // We can't use Malloc in Burst easily without passing an allocator? 
-        // Actually Allocator.Temp works in Burst if on main thread? 
-        // No, "Burst does not support managed objects". 
-        // UnsafeUtility.Malloc IS supported.
-
         Candidate* candidates = (Candidate*)UnsafeUtility.Malloc(maxResults * sizeof(Candidate), 4, Allocator.Temp);
         int candidateCount = 0;
 
-        // SIMD setup
-        float2 target = position;
+        float4 target4 = new float4(position.x, position.y, position.x, position.y);
 
         while (searchRadius < maxSearchRadius)
         {
-            int minX = math.max(0, startX - searchRadius);
-            int maxX = math.min(width - 1, startX + searchRadius);
-            int minY = math.max(0, startY - searchRadius);
-            int maxY = math.min(height - 1, startY + searchRadius);
+            int rMinX = math.max(0, startX - searchRadius);
+            int rMaxX = math.min(width - 1, startX + searchRadius);
+            int rMinY = math.max(0, startY - searchRadius);
+            int rMaxY = math.min(height - 1, startY + searchRadius);
 
-            // Ring Loop
-            if (searchRadius == 0)
+            // Process cells
+            for (int y = rMinY; y <= rMaxY; y++)
             {
-                ProcessCell(startX, startY, target, positions, gridHead, next, width, candidates, &candidateCount, maxResults);
-            }
-            else
-            {
-                for (int x = minX; x <= maxX; x++)
+                for (int x = rMinX; x <= rMaxX; x++)
                 {
-                    if (minY == startY - searchRadius) ProcessCell(x, minY, target, positions, gridHead, next, width, candidates, &candidateCount, maxResults);
-                    if (maxY == startY + searchRadius && maxY != minY) ProcessCell(x, maxY, target, positions, gridHead, next, width, candidates, &candidateCount, maxResults);
-                }
-                for (int y = minY + 1; y <= maxY - 1; y++)
-                {
-                    if (minX == startX - searchRadius) ProcessCell(minX, y, target, positions, gridHead, next, width, candidates, &candidateCount, maxResults);
-                    if (maxX == startX + searchRadius && maxX != minX) ProcessCell(maxX, y, target, positions, gridHead, next, width, candidates, &candidateCount, maxResults);
+                    // Process only the ring
+                    if (searchRadius > 0 && x > rMinX && x < rMaxX && y > rMinY && y < rMaxY) continue;
+
+                    int cellIndex = y * width + x;
+                    int start = cellStart[cellIndex];
+                    int count = cellCount[cellIndex];
+
+                    for (int i = 0; i < count; i += 4)
+                    {
+                        if (i + 3 < count)
+                        {
+                            float4 v0 = *(float4*)(sortedPositions + start + i);
+                            float4 v1 = *(float4*)(sortedPositions + start + i + 2);
+
+                            float4 d0 = v0 - target4;
+                            float4 d1 = v1 - target4;
+
+                            float4 sq0 = d0 * d0;
+                            float4 sq1 = d1 * d1;
+
+                            float2 dists0 = sq0.xz + sq0.yw;
+                            float2 dists1 = sq1.xz + sq1.yw;
+
+                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i], DistSq = dists0.x };
+                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 1], DistSq = dists0.y };
+                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 2], DistSq = dists1.x };
+                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 3], DistSq = dists1.y };
+                        }
+                        else
+                        {
+                            for (int j = i; j < count; j++)
+                            {
+                                float distSq = math.distancesq(sortedPositions[start + j], position);
+                                if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + j], DistSq = distSq };
+                            }
+                        }
+                    }
                 }
             }
 
             if (candidateCount >= k)
             {
-                // Sort candidates
-                // Simple bubble sort or insertion sort for small N, or QuickSort
-                // Since we are in Burst, we can write a simple sort.
                 SortCandidates(candidates, candidateCount);
-
                 float kthDistSq = candidates[k - 1].DistSq;
 
-                // Dist to next ring
-                float distToNextRingSq = GetDistanceToRectSq(position,
+                float nextRingDistSq = GetDistanceToRectSq(position,
                     (startX - (searchRadius + 1)) * cellSize + origin.x,
                     (startY - (searchRadius + 1)) * cellSize + origin.y,
                     (startX + (searchRadius + 1) + 1) * cellSize + origin.x,
                     (startY + (searchRadius + 1) + 1) * cellSize + origin.y
                 );
 
-                if (kthDistSq <= distToNextRingSq) break;
+                if (kthDistSq <= nextRingDistSq) break;
             }
             searchRadius++;
         }
@@ -261,87 +258,6 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         *resultCount = finalCount;
 
         UnsafeUtility.Free(candidates, Allocator.Temp);
-    }
-
-    private static void ProcessCell(int x, int y, float2 target, float2* positions, int* gridHead, int* next, int width, Candidate* candidates, int* candidateCount, int maxCandidates)
-    {
-        int cellIndex = y * width + x;
-        int current = gridHead[cellIndex];
-
-        // SIMD Batching
-        // We can process 4 at a time using float4
-        // But we are reading from linked list (random access), so gather is needed.
-        // Since we are in Burst, the compiler might auto-vectorize if we write it simply.
-        // But manual SIMD with linked list is tricky because of the dependency chain.
-        // We can gather into a buffer.
-
-        int batchSize = 4;
-        float2* batchPos = stackalloc float2[batchSize];
-        int* batchIndices = stackalloc int[batchSize];
-        int count = 0;
-
-        while (current != -1)
-        {
-            if (*candidateCount >= maxCandidates) break; // Safety break
-
-            batchPos[count] = positions[current];
-            batchIndices[count] = current;
-            count++;
-
-            if (count == batchSize)
-            {
-                ProcessBatch(batchPos, batchIndices, count, target, candidates, candidateCount, maxCandidates);
-                count = 0;
-            }
-
-            current = next[current];
-        }
-
-        if (count > 0)
-        {
-            ProcessBatch(batchPos, batchIndices, count, target, candidates, candidateCount, maxCandidates);
-        }
-    }
-
-    private static void ProcessBatch(float2* batchPos, int* batchIndices, int count, float2 target, Candidate* candidates, int* candidateCount, int maxCandidates)
-    {
-        // Manual SIMD using float4
-        // We have up to 4 points.
-        // x1, y1, x2, y2, ...
-
-        // Load into float4s
-        // x: x1, x2, x3, x4
-        // y: y1, y2, y3, y4
-
-        float4 px = new float4(
-            count > 0 ? batchPos[0].x : 0,
-            count > 1 ? batchPos[1].x : 0,
-            count > 2 ? batchPos[2].x : 0,
-            count > 3 ? batchPos[3].x : 0
-        );
-
-        float4 py = new float4(
-            count > 0 ? batchPos[0].y : 0,
-            count > 1 ? batchPos[1].y : 0,
-            count > 2 ? batchPos[2].y : 0,
-            count > 3 ? batchPos[3].y : 0
-        );
-
-        float4 tx = new float4(target.x);
-        float4 ty = new float4(target.y);
-
-        float4 dx = px - tx;
-        float4 dy = py - ty;
-        float4 dSq = dx * dx + dy * dy;
-
-        for (int i = 0; i < count; i++)
-        {
-            if (*candidateCount < maxCandidates)
-            {
-                candidates[*candidateCount] = new Candidate { Index = batchIndices[i], DistSq = dSq[i] };
-                (*candidateCount)++;
-            }
-        }
     }
 
     private static void SortCandidates(Candidate* arr, int count)
@@ -374,26 +290,13 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     public void QueryRadius(Vector2 position, float radius, List<int> results)
     {
         results.Clear();
-
-        // Similar strategy: Allocate temp buffer
-        int maxResults = _count; // Worst case all
-                                 // But allocating _count might be too big for stack.
-                                 // Use UnsafeUtility.Malloc(Allocator.Temp)
-
+        int maxResults = _count;
         int* resultBuffer = (int*)UnsafeUtility.Malloc(maxResults * sizeof(int), 4, Allocator.Temp);
         int resultCount = 0;
 
         try
         {
-            fixed (int* gridHeadPtr = _gridHead)
-            fixed (int* nextPtr = _next)
-            {
-                Span<Vector2> posSpan = _positions.AsSpan();
-                fixed (Vector2* posPtr = posSpan)
-                {
-                    QueryRadiusBurst(new float2(position.x, position.y), radius * radius, (float2*)posPtr, gridHeadPtr, nextPtr, _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxResults);
-                }
-            }
+            QueryRadiusBurst(new float2(position.x, position.y), radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxResults);
 
             for (int i = 0; i < resultCount; i++)
             {
@@ -407,7 +310,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryRadiusBurst(in float2 position, float radiusSq, float2* positions, int* gridHead, int* next, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
+    private static void QueryRadiusBurst(in float2 position, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
     {
         float radius = math.sqrt(radiusSq);
         int minX = (int)((position.x - radius - origin.x) / cellSize);
@@ -420,67 +323,86 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         if (minY < 0) minY = 0;
         if (maxY >= height) maxY = height - 1;
 
-        float2 target = position;
-        float4 rSqVec = new float4(radiusSq);
-        float4 tx = new float4(target.x);
-        float4 ty = new float4(target.y);
+        // 1. Gather all indices first
+        int totalCandidates = 0;
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int x = minX; x <= maxX; x++)
+            {
+                totalCandidates += cellCount[y * width + x];
+            }
+        }
 
-        int batchSize = 4;
-        float2* batchPos = stackalloc float2[batchSize];
-        int* batchIndices = stackalloc int[batchSize];
+        if (totalCandidates == 0) return;
 
-        int count = 0;
-
+        int* candidateIndices = (int*)UnsafeUtility.Malloc(totalCandidates * sizeof(int), 4, Allocator.Temp);
+        int gatheredCount = 0;
         for (int y = minY; y <= maxY; y++)
         {
             for (int x = minX; x <= maxX; x++)
             {
                 int cellIndex = y * width + x;
-                int current = gridHead[cellIndex];
-
-                while (current != -1)
-                {
-                    batchPos[count] = positions[current];
-                    batchIndices[count] = current;
-                    count++;
-
-                    if (count == batchSize)
-                    {
-                        // Process Batch
-                        float4 px = new float4(batchPos[0].x, batchPos[1].x, batchPos[2].x, batchPos[3].x);
-                        float4 py = new float4(batchPos[0].y, batchPos[1].y, batchPos[2].y, batchPos[3].y);
-
-                        float4 dx = px - tx;
-                        float4 dy = py - ty;
-                        float4 dSq = dx * dx + dy * dy;
-
-                        bool4 mask = dSq <= rSqVec;
-
-                        if (mask.x) results[(*resultCount)++] = batchIndices[0];
-                        if (mask.y) results[(*resultCount)++] = batchIndices[1];
-                        if (mask.z) results[(*resultCount)++] = batchIndices[2];
-                        if (mask.w) results[(*resultCount)++] = batchIndices[3];
-
-                        count = 0;
-                    }
-
-                    current = next[current];
-                }
+                int start = cellStart[cellIndex];
+                int count = cellCount[cellIndex];
+                UnsafeUtility.MemCpy(candidateIndices + gatheredCount, originalIndices + start, count * sizeof(int));
+                gatheredCount += count;
             }
         }
 
-        // Leftovers
-        if (count > 0)
+        // 2. Process in batch
+        float4 rSqVec = new float4(radiusSq);
+        float4 target4 = new float4(position.x, position.y, position.x, position.y);
+
+        int i = 0;
+        for (; i <= gatheredCount - 4; i += 4)
         {
-            for (int i = 0; i < count; i++)
+            // This is still not ideal as we are jumping around in the original positions array.
+            // The sortedPositions array is what we need to use.
+            // Let's fix this.
+        }
+        
+        // Corrected approach: We already have sortedPositions. We just need to iterate through the right cells.
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int x = minX; x <= maxX; x++)
             {
-                float dx = batchPos[i].x - target.x;
-                float dy = batchPos[i].y - target.y;
-                if (dx * dx + dy * dy <= radiusSq)
+                int cellIndex = y * width + x;
+                int start = cellStart[cellIndex];
+                int count = cellCount[cellIndex];
+
+                for (i = 0; i <= count - 4; i += 4)
                 {
-                    results[(*resultCount)++] = batchIndices[i];
+                    float4 v0 = *(float4*)(sortedPositions + start + i);
+                    float4 v1 = *(float4*)(sortedPositions + start + i + 2);
+
+                    float4 d0 = v0 - target4;
+                    float4 d1 = v1 - target4;
+
+                    float4 sq0 = d0 * d0;
+                    float4 sq1 = d1 * d1;
+
+                    float2 dists0 = sq0.xz + sq0.yw;
+                    float2 dists1 = sq1.xz + sq1.yw;
+
+                    bool4 mask0 = dists0.xyxy <= rSqVec;
+                    bool4 mask1 = dists1.xyxy <= rSqVec;
+
+                    if (mask0.x) results[(*resultCount)++] = originalIndices[start + i];
+                    if (mask0.y) results[(*resultCount)++] = originalIndices[start + i + 1];
+                    if (mask1.x) results[(*resultCount)++] = originalIndices[start + i + 2];
+                    if (mask1.y) results[(*resultCount)++] = originalIndices[start + i + 3];
+                }
+
+                for (; i < count; i++)
+                {
+                    if (math.distancesq(sortedPositions[start + i], position) <= radiusSq)
+                    {
+                        results[(*resultCount)++] = originalIndices[start + i];
+                    }
                 }
             }
         }
+        
+        UnsafeUtility.Free(candidateIndices, Allocator.Temp);
     }
 }

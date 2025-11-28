@@ -232,6 +232,9 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = new SearchJob { NodeIndex = rootIndex, MinDistSq = 0 };
 
+        // Optimization: Track worst distance to prune nodes early
+        float worstDistSq = float.MaxValue;
+
         while (stackCount > 0)
         {
             SearchJob job = stack[--stackCount];
@@ -239,28 +242,22 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
             if (nodeIndex == -1) continue;
 
-            if (candidateCount >= k)
-            {
-                // Find worst
-                float worstDistSq = 0;
-                for(int i=0; i<candidateCount; ++i) if(candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
-                
-                // If full and worst is better than min dist, skip
-                // Actually we should maintain a sorted list or heap to quickly know worst.
-                // For simplicity, just linear scan worst if k is small.
-                // If k is large, this is slow.
-                // But we sort at the end.
-                
-                // Optimization: Keep candidates sorted or max-heap.
-                // Let's just do simple insertion.
-                
-                if (candidateCount == k && job.MinDistSq >= candidates[k-1].DistSq) continue;
-            }
+            // Optimization: Pruning
+            if (candidateCount >= k && job.MinDistSq >= worstDistSq) continue;
 
             int unitIdx = nodes[nodeIndex].UnitIndex;
             float distSq = math.distancesq(positions[unitIdx], position);
 
-            AddCandidate(unitIdx, distSq, k, candidates, &candidateCount);
+            if (candidateCount < k || distSq < worstDistSq)
+            {
+                AddCandidate(unitIdx, distSq, k, candidates, &candidateCount);
+                if (candidateCount >= k)
+                {
+                    // Update worstDistSq
+                    worstDistSq = 0;
+                    for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                }
+            }
 
             int axis = nodes[nodeIndex].Axis;
             float diff = (axis == 0) ? (position.x - positions[unitIdx].x) : (position.y - positions[unitIdx].y);
