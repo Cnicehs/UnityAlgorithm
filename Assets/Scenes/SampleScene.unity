@@ -373,7 +373,9 @@ MonoBehaviour:
   WorldSize: 50
   AgentRadius: 0.5
   AgentSpeed: 2
-  ShowDebugGizmos: 0
+  ShowDebugGizmos: 1
+  SpatialIndexType: 4
+  GridResolution: 10
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

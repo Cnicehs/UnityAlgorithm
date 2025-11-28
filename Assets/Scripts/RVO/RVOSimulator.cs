@@ -63,6 +63,18 @@ public class RVOSimulator
         return _agents.Count;
     }
 
+    private List<RVOObstacle> _obstacles = new List<RVOObstacle>();
+
+    public void AddObstacle(Vector2 p1, Vector2 p2)
+    {
+        _obstacles.Add(new RVOObstacle(p1, p2));
+    }
+
+    public void ClearObstacles()
+    {
+        _obstacles.Clear();
+    }
+
     public void Step(float dt)
     {
         using (PerformanceProfiler.ProfilerScope.Begin("RVO.Step"))
@@ -97,7 +109,13 @@ public class RVOSimulator
                 {
                     RVOAgent agent = _agents[i];
                     
-                    // Re-query neighbors
+                    // Re-query neighbors (Redundant? The previous block didn't store them per agent)
+                    // Optimization: We should store neighbors or do it in one pass.
+                    // For now, let's just re-query or fix the logic.
+                    // The previous block was just profiling? No, it was populating _neighbors but not using it?
+                    // Ah, the previous block was iterating but overwriting _neighbors.
+                    // Let's do the query inside the compute loop to be correct.
+                    
                     _neighborIndices.Clear();
                     SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
 
@@ -113,6 +131,12 @@ public class RVOSimulator
                     }
 
                     // Construct ORCA Lines
+                    _orcaLines.Clear();
+                    
+                    // Add Obstacle Lines FIRST
+                    RVOMath.ConstructObstacleORCALines(agent, _obstacles, dt, _orcaLines);
+                    
+                    // Add Agent Lines
                     RVOMath.ConstructORCALines(agent, _neighbors, dt, _orcaLines);
 
                     // Linear Programming
