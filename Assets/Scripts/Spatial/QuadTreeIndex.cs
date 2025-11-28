@@ -22,7 +22,6 @@ public class QuadTreeIndex : ISpatialIndex
     // Linked list for units in leaves
     private int[] _linkedUnits; // Points to next unit in the same leaf
     private int[] _unitIndices; // The actual unit index
-    private int _linkCount;
 
     private List<Vector2> _positions;
     private Rect _bounds;
@@ -55,7 +54,7 @@ public class QuadTreeIndex : ISpatialIndex
         }
 
         _nodeCount = 0;
-        _linkCount = 0;
+
 
         // Create Root
         _rootIndex = _nodeCount++;
