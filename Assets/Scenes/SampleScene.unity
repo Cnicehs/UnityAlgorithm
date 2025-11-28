@@ -317,8 +317,8 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1167852290}
-  - component: {fileID: 1167852291}
   - component: {fileID: 1167852292}
+  - component: {fileID: 1167852293}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -341,7 +341,7 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1167852291
+--- !u!114 &1167852292
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -350,24 +350,13 @@ MonoBehaviour:
   m_GameObject: {fileID: 1167852288}
   m_Enabled: 0
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: dca5b17b6f7bc4dbc946a3640d29065c, type: 3}
+  m_Script: {fileID: 11500000, guid: 1b22642dcb2be45c19e35fb239613ae3, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  StructureType: 4
-  UnitCount: 10000
-  WorldSize: 10
-  UnitSpeed: 5
-  UseMultiThreading: 0
-  GridResolution: 40
-  PerformQueries: 1
-  QueryK: 5
-  QueryRadius: 10
-  ShowGizmos: 1
-  BuildTimeMs: 0
-  QueryTimeMs: 0
-  IsBuilding: 0
-  IsQuerying: 0
---- !u!114 &1167852292
+  UnitCount: 100000
+  Iterations: 100
+  Radius: 10
+--- !u!114 &1167852293
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -376,12 +365,15 @@ MonoBehaviour:
   m_GameObject: {fileID: 1167852288}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1b22642dcb2be45c19e35fb239613ae3, type: 3}
+  m_Script: {fileID: 11500000, guid: 1e8589f4cbe674cf6902ffe26185db20, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  UnitCount: 100000
-  Iterations: 100
-  Radius: 10
+  UseSIMD: 1
+  AgentCount: 5000
+  WorldSize: 50
+  AgentRadius: 0.5
+  AgentSpeed: 2
+  ShowDebugGizmos: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

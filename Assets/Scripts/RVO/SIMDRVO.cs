@@ -209,4 +209,114 @@ public static unsafe class SIMDRVO
             }
         }
     }
+
+    [BurstCompile]
+    public static unsafe void ComputeRVOVelocities(
+        AgentData* agents,
+        int* neighborIndices,
+        int* neighborCounts,
+        int* neighborOffsets,
+        float2* newVelocities,
+        int agentCount,
+        float timeStep)
+    {
+        const int MAX_LINES = 128;
+        
+        // Stack alloc for ORCA lines - Allocate ONCE outside the loop to prevent stack overflow
+        ORCALine* orcaLines = stackalloc ORCALine[MAX_LINES];
+
+        for (int agentIdx = 0; agentIdx < agentCount; agentIdx++)
+        {
+            AgentData agent = agents[agentIdx];
+            int count = neighborCounts[agentIdx];
+            int offset = neighborOffsets[agentIdx];
+
+            int lineCount = 0;
+
+            float invTimeHorizon = 1.0f / agent.TimeHorizon;
+
+            // Construct ORCA lines for all neighbors
+            for (int i = 0; i < count; ++i)
+            {
+                int neighborIdx = neighborIndices[offset + i];
+                if (neighborIdx == agentIdx) continue;
+
+                AgentData other = agents[neighborIdx];
+
+                float2 relativePosition = other.Position - agent.Position;
+                float2 relativeVelocity = agent.Velocity - other.Velocity;
+                float distSq = math.lengthsq(relativePosition);
+                float combinedRadius = agent.Radius + other.Radius;
+                float combinedRadiusSq = combinedRadius * combinedRadius;
+
+                ORCALine line;
+                float2 u;
+
+                if (distSq > combinedRadiusSq)
+                {
+                    // No collision
+                    float2 w = relativeVelocity - invTimeHorizon * relativePosition;
+                    float wLengthSq = math.lengthsq(w);
+                    float dotProduct1 = math.dot(w, relativePosition);
+
+                    if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
+                    {
+                        // Project on cut-off circle
+                        float wLength = math.sqrt(wLengthSq);
+                        float2 unitW = w / wLength;
+
+                        line.Direction = new float2(unitW.y, -unitW.x);
+                        u = (combinedRadius * invTimeHorizon - wLength) * unitW;
+                    }
+                    else
+                    {
+                        // Project on legs
+                        float leg = math.sqrt(distSq - combinedRadiusSq);
+                        if (det(relativePosition, w) > 0.0f)
+                        {
+                            line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, 
+                                                       relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
+                        }
+                        else
+                        {
+                            line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, 
+                                                        -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
+                        }
+
+                        float dotProduct2 = math.dot(relativeVelocity, line.Direction);
+                        u = dotProduct2 * line.Direction - relativeVelocity;
+                    }
+                }
+                else
+                {
+                    // Collision
+                    float invTimeStep = 1.0f / timeStep;
+                    float2 w = relativeVelocity - invTimeStep * relativePosition;
+                    float wLength = math.length(w);
+                    float2 unitW = w / wLength;
+
+                    line.Direction = new float2(unitW.y, -unitW.x);
+                    u = (combinedRadius * invTimeStep - wLength) * unitW;
+                }
+
+                line.Point = agent.Velocity + 0.5f * u;
+                
+                if (lineCount < MAX_LINES)
+                {
+                    orcaLines[lineCount++] = line;
+                }
+            }
+
+            // Solve linear program to find new velocity
+            float2 newVel = float2.zero;
+            int lineFail = linearProgram2(orcaLines, lineCount, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
+
+            if (lineFail < lineCount)
+            {
+                linearProgram3(orcaLines, lineCount, 0, lineFail, agent.MaxSpeed, ref newVel);
+            }
+
+            newVelocities[agentIdx] = newVel;
+        }
+    }
 }

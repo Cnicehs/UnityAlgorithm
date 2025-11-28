@@ -2,9 +2,9 @@ using System.Collections.Generic;
 using UnityEngine;
 using Unity.Mathematics;
 using Unity.Collections;
-using Unity.Jobs;
 using Unity.Burst;
 using Unity.Collections.LowLevel.Unsafe;
+using System.Runtime.InteropServices;
 
 public class SIMDRVOSimulator
 {
@@ -18,6 +18,10 @@ public class SIMDRVOSimulator
     public float Radius = 0.5f;
     public float MaxSpeed = 2.0f;
 
+    public float NeighborQueryTimeMs => (float)PerformanceProfiler.GetLastMs("SIMDRVO.NeighborQuery");
+    public float RVOComputeTimeMs => (float)PerformanceProfiler.GetLastMs("SIMDRVO.Compute");
+    public float TotalStepTimeMs => (float)PerformanceProfiler.GetLastMs("SIMDRVO.Step");
+
     private NativeArray<SIMDRVO.AgentData> _agents;
     private NativeArray<float2> _newVelocities;
     private int _agentCount;
@@ -25,7 +29,6 @@ public class SIMDRVOSimulator
     private NativeArray<int> _neighborIndices;
     private NativeArray<int> _neighborCounts;
     private NativeArray<int> _neighborOffsets;
-    private int _maxNeighborCountTotal;
 
     private SIMDRVOSimulator()
     {
@@ -42,10 +45,9 @@ public class SIMDRVOSimulator
         _agents = new NativeArray<SIMDRVO.AgentData>(count, Allocator.Persistent);
         _newVelocities = new NativeArray<float2>(count, Allocator.Persistent);
         
-        // Allocate neighbor buffers. Assume max neighbors * count for safety, or resize dynamically.
-        // For 10k agents * 10 neighbors = 100k ints. Safe to allocate.
-        _maxNeighborCountTotal = count * MaxNeighbors;
-        _neighborIndices = new NativeArray<int>(_maxNeighborCountTotal, Allocator.Persistent);
+        // Allocate with fixed stride per agent
+        int totalNeighborSlots = count * MaxNeighbors;
+        _neighborIndices = new NativeArray<int>(totalNeighborSlots, Allocator.Persistent);
         _neighborCounts = new NativeArray<int>(count, Allocator.Persistent);
         _neighborOffsets = new NativeArray<int>(count, Allocator.Persistent);
         
@@ -91,153 +93,54 @@ public class SIMDRVOSimulator
 
     private List<int> _tempNeighbors = new List<int>();
 
-    public void Step(float dt)
+    public unsafe void Step(float dt)
     {
-        // 1. Build Neighbor Lists
-        int currentOffset = 0;
-        for (int i = 0; i < _agentCount; i++)
+        using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.Step"))
         {
-            var agent = _agents[i];
-            _tempNeighbors.Clear();
-            SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
-
-            int count = 0;
-            for (int j = 0; j < _tempNeighbors.Count; j++)
+            // 1. Build Neighbor Lists (Main Thread)
+            using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.NeighborQuery"))
             {
-                if (count >= MaxNeighbors) break;
-                int neighborIdx = _tempNeighbors[j];
-                if (neighborIdx != i)
+                for (int i = 0; i < _agentCount; i++)
                 {
-                    if (currentOffset + count < _neighborIndices.Length)
+                    var agent = _agents[i];
+                    _tempNeighbors.Clear();
+                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
+
+                    // Calculate offset for this agent's neighbor data
+                    int offset = i * MaxNeighbors;
+                    int count = 0;
+                    
+                    // Bounds check: ensure we don't exceed array capacity
+                    int maxNeighborsForThisAgent = math.min(MaxNeighbors, _neighborIndices.Length - offset);
+                    
+                    for (int j = 0; j < _tempNeighbors.Count && count < maxNeighborsForThisAgent; j++)
                     {
-                        _neighborIndices[currentOffset + count] = neighborIdx;
-                        count++;
+                        int neighborIdx = _tempNeighbors[j];
+                        if (neighborIdx != i && neighborIdx < _agentCount)
+                        {
+                            _neighborIndices[offset + count] = neighborIdx;
+                            count++;
+                        }
                     }
+                    
+                    _neighborCounts[i] = count;
+                    _neighborOffsets[i] = offset;
                 }
             }
-            
-            _neighborCounts[i] = count;
-            _neighborOffsets[i] = currentOffset;
-            currentOffset += MaxNeighbors; 
-        }
 
-        // 2. Schedule RVO Job
-        var rvoJob = new RVOJob
-        {
-            Agents = _agents,
-            NeighborIndices = _neighborIndices,
-            NeighborCounts = _neighborCounts,
-            NeighborOffsets = _neighborOffsets,
-            TimeStep = dt,
-            NewVelocities = _newVelocities
-        };
-
-        JobHandle handle = rvoJob.Schedule(_agentCount, 64);
-        handle.Complete();
-    }
-}
-
-[BurstCompile]
-public struct RVOJob : IJobParallelFor
-{
-    [ReadOnly] public NativeArray<SIMDRVO.AgentData> Agents;
-    [ReadOnly] public NativeArray<int> NeighborIndices; // Flattened
-    [ReadOnly] public NativeArray<int> NeighborCounts;  // Count per agent
-    [ReadOnly] public NativeArray<int> NeighborOffsets; // Offset per agent
-    [ReadOnly] public float TimeStep;
-
-    public NativeArray<float2> NewVelocities;
-
-    public unsafe void Execute(int index)
-    {
-        var agent = Agents[index];
-        int count = NeighborCounts[index];
-        int offset = NeighborOffsets[index];
-
-        // Stack alloc for ORCA lines
-        // Max neighbors + obstacles. 
-        const int MAX_LINES = 128;
-        ORCALine* orcaLines = stackalloc ORCALine[MAX_LINES];
-        int lineCount = 0;
-
-        float invTimeHorizon = 1.0f / agent.TimeHorizon;
-
-        for (int i = 0; i < count; ++i)
-        {
-            int neighborIdx = NeighborIndices[offset + i];
-            if (neighborIdx == index) continue;
-
-            var other = Agents[neighborIdx];
-
-            float2 relativePosition = other.Position - agent.Position;
-            float2 relativeVelocity = agent.Velocity - other.Velocity;
-            float distSq = math.lengthsq(relativePosition);
-            float combinedRadius = agent.Radius + other.Radius;
-            float combinedRadiusSq = combinedRadius * combinedRadius;
-
-            ORCALine line;
-            float2 u;
-
-            if (distSq > combinedRadiusSq)
+            // 2. Compute RVO velocities using Burst (Single-threaded, SIMD-accelerated)
+            using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.Compute"))
             {
-                float2 w = relativeVelocity - invTimeHorizon * relativePosition;
-                float wLengthSq = math.lengthsq(w);
-                float dotProduct1 = math.dot(w, relativePosition);
-
-                if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
-                {
-                    float wLength = math.sqrt(wLengthSq);
-                    float2 unitW = w / wLength;
-
-                    line.Direction = new float2(unitW.y, -unitW.x);
-                    u = (combinedRadius * invTimeHorizon - wLength) * unitW;
-                }
-                else
-                {
-                    float leg = math.sqrt(distSq - combinedRadiusSq);
-                    if (SIMDRVO.det(relativePosition, w) > 0.0f)
-                    {
-                        line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                    }
-                    else
-                    {
-                        line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                    }
-
-                    float dotProduct2 = math.dot(relativeVelocity, line.Direction);
-                    u = dotProduct2 * line.Direction - relativeVelocity;
-                }
-            }
-            else
-            {
-                float invTimeStep = 1.0f / TimeStep;
-                float2 w = relativeVelocity - invTimeStep * relativePosition;
-                float wLength = math.length(w);
-                float2 unitW = w / wLength;
-
-                line.Direction = new float2(unitW.y, -unitW.x);
-                u = (combinedRadius * invTimeStep - wLength) * unitW;
-            }
-
-            line.Point = agent.Velocity + 0.5f * u;
-            
-            if (lineCount < MAX_LINES)
-            {
-                orcaLines[lineCount++] = line;
+                SIMDRVO.ComputeRVOVelocities(
+                    (SIMDRVO.AgentData*)_agents.GetUnsafePtr(),
+                    (int*)_neighborIndices.GetUnsafePtr(),
+                    (int*)_neighborCounts.GetUnsafePtr(),
+                    (int*)_neighborOffsets.GetUnsafePtr(),
+                    (float2*)_newVelocities.GetUnsafePtr(),
+                    _agentCount,
+                    dt
+                );
             }
         }
-
-        float2 newVel = float2.zero; // Start with zero or current velocity, but linearProgram2 overwrites it if successful.
-        // RVO2 usually optimizes towards PrefVelocity.
-        // But linearProgram2 initializes result.
-        
-        int lineFail = SIMDRVO.linearProgram2(orcaLines, lineCount, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
-
-        if (lineFail < lineCount)
-        {
-            SIMDRVO.linearProgram3(orcaLines, lineCount, 0, lineFail, agent.MaxSpeed, ref newVel);
-        }
-
-        NewVelocities[index] = newVel;
     }
 }

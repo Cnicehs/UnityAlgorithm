@@ -14,6 +14,11 @@ public class RVOSimulator
     public float Radius = 0.5f;
     public float MaxSpeed = 2.0f;
 
+    public float NeighborQueryTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.NeighborQuery");
+    public float RVOComputeTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.Compute");
+    public float PositionUpdateTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.PositionUpdate");
+    public float TotalStepTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.Step");
+
     private List<RVOAgent> _agents = new List<RVOAgent>();
     private List<ORCALine> _orcaLines = new List<ORCALine>();
     private List<int> _neighborIndices = new List<int>();
@@ -60,54 +65,78 @@ public class RVOSimulator
 
     public void Step(float dt)
     {
-        // 1. Update Spatial Index (Handled by SpatialIndexManager)
-        // We assume SpatialIndexManager has updated the index with current agent positions.
-        
-        // 2. Compute New Velocities
-        for (int i = 0; i < _agents.Count; i++)
+        using (PerformanceProfiler.ProfilerScope.Begin("RVO.Step"))
         {
-            RVOAgent agent = _agents[i];
-            
-            // Find Neighbors
-            _neighborIndices.Clear();
-            SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
-
-            _neighbors.Clear();
-            for (int j = 0; j < _neighborIndices.Count; j++)
+            // 1. Neighbor Query Phase
+            using (PerformanceProfiler.ProfilerScope.Begin("RVO.NeighborQuery"))
             {
-                int idx = _neighborIndices[j];
-                if (idx != i) // Don't collide with self
+                for (int i = 0; i < _agents.Count; i++)
                 {
-                    // Note: This assumes agent indices match spatial index indices.
-                    // This is true if we manage them in sync.
-                    if (idx < _agents.Count)
+                    RVOAgent agent = _agents[i];
+                    
+                    _neighborIndices.Clear();
+                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
+
+                    _neighbors.Clear();
+                    for (int j = 0; j < _neighborIndices.Count; j++)
                     {
-                        _neighbors.Add(_agents[idx]);
+                        int idx = _neighborIndices[j];
+                        if (idx != i && idx < _agents.Count)
+                        {
+                            _neighbors.Add(_agents[idx]);
+                        }
+                        if (_neighbors.Count >= agent.MaxNeighbors) break;
                     }
                 }
-                if (_neighbors.Count >= agent.MaxNeighbors) break;
             }
-
-            // Construct ORCA Lines
-            RVOMath.ConstructORCALines(agent, _neighbors, dt, _orcaLines);
-
-            // Linear Programming
-            float2 newVel = agent.NewVelocity;
-            int lineFail = RVOMath.linearProgram2(_orcaLines, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
-
-            if (lineFail < _orcaLines.Count)
+            
+            // 2. RVO Computation Phase
+            using (PerformanceProfiler.ProfilerScope.Begin("RVO.Compute"))
             {
-                RVOMath.linearProgram3(_orcaLines, 0, lineFail, agent.MaxSpeed, ref newVel);
+                for (int i = 0; i < _agents.Count; i++)
+                {
+                    RVOAgent agent = _agents[i];
+                    
+                    // Re-query neighbors
+                    _neighborIndices.Clear();
+                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
+
+                    _neighbors.Clear();
+                    for (int j = 0; j < _neighborIndices.Count; j++)
+                    {
+                        int idx = _neighborIndices[j];
+                        if (idx != i && idx < _agents.Count)
+                        {
+                            _neighbors.Add(_agents[idx]);
+                        }
+                        if (_neighbors.Count >= agent.MaxNeighbors) break;
+                    }
+
+                    // Construct ORCA Lines
+                    RVOMath.ConstructORCALines(agent, _neighbors, dt, _orcaLines);
+
+                    // Linear Programming
+                    float2 newVel = agent.NewVelocity;
+                    int lineFail = RVOMath.linearProgram2(_orcaLines, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
+
+                    if (lineFail < _orcaLines.Count)
+                    {
+                        RVOMath.linearProgram3(_orcaLines, 0, lineFail, agent.MaxSpeed, ref newVel);
+                    }
+
+                    agent.NewVelocity = newVel;
+                }
             }
 
-            agent.NewVelocity = newVel;
-        }
-
-        // 3. Update Positions
-        for (int i = 0; i < _agents.Count; i++)
-        {
-            _agents[i].Velocity = _agents[i].NewVelocity;
-            _agents[i].Position += _agents[i].Velocity * dt;
+            // 3. Position Update Phase
+            using (PerformanceProfiler.ProfilerScope.Begin("RVO.PositionUpdate"))
+            {
+                for (int i = 0; i < _agents.Count; i++)
+                {
+                    _agents[i].Velocity = _agents[i].NewVelocity;
+                    _agents[i].Position += _agents[i].Velocity * dt;
+                }
+            }
         }
     }
 }

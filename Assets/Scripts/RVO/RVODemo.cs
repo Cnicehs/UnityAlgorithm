@@ -11,6 +11,7 @@ public class RVODemo : MonoBehaviour
     public float AgentRadius = 0.5f;
     public float AgentSpeed = 2.0f;
     public bool ShowDebugGizmos = false;
+    public SpatialStructureType SpatialIndexType = SpatialStructureType.SIMDKDTree;
     
     private List<GameObject> _agentVisuals = new List<GameObject>();
     private List<Vector2> _positions = new List<Vector2>();
@@ -20,6 +21,7 @@ public class RVODemo : MonoBehaviour
     void Start()
     {
         // Initialize Managers
+        SpatialIndexManager.Instance.StructureType = SpatialIndexType;
         SpatialIndexManager.Instance.Initialize(AgentCount, WorldSize);
         
         RVOSimulator.Instance.Radius = AgentRadius;
@@ -174,12 +176,37 @@ public class RVODemo : MonoBehaviour
 
     private void OnGUI()
     {
-        GUILayout.BeginArea(new Rect(10, 10, 300, 150));
+        GUILayout.BeginArea(new Rect(10, 10, 450, 300));
         GUILayout.Label($"RVO Demo - {(UseSIMD ? "SIMD" : "Standard")} Mode");
         GUILayout.Label($"Agents: {AgentCount}");
+        GUILayout.Label($"Spatial Index: {SpatialIndexManager.Instance.StructureType}");
         GUILayout.Label($"FPS: {1.0f/Time.smoothDeltaTime:F1}");
+        
+        GUILayout.Space(10);
+        GUILayout.Label("=== Spatial Index Performance ===");
+        GUILayout.Label($"Build Time: {SpatialIndexManager.Instance.BuildTimeMs:F3} ms");
+        GUILayout.Label($"Building: {(SpatialIndexManager.Instance.IsBuilding ? "Yes" : "No")}");
+        
+        GUILayout.Space(10);
+        if (UseSIMD)
+        {
+            GUILayout.Label("=== SIMD RVO Performance ===");
+            GUILayout.Label($"Neighbor Query: {SIMDRVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
+            GUILayout.Label($"RVO Compute (Burst): {SIMDRVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
+            GUILayout.Label($"Total Step: {SIMDRVOSimulator.Instance.TotalStepTimeMs:F3} ms");
+        }
+        else
+        {
+            GUILayout.Label("=== Standard RVO Performance ===");
+            GUILayout.Label($"Neighbor Query: {RVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
+            GUILayout.Label($"RVO Compute: {RVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
+            GUILayout.Label($"Position Update: {RVOSimulator.Instance.PositionUpdateTimeMs:F3} ms");
+            GUILayout.Label($"Total Step: {RVOSimulator.Instance.TotalStepTimeMs:F3} ms");
+        }
+        
         if (ShowDebugGizmos)
         {
+            GUILayout.Space(10);
             GUILayout.Label($"Debug Agent: {_debugAgentIndex}");
             GUILayout.Label($"Neighbors: {_debugNeighbors.Count}");
         }
