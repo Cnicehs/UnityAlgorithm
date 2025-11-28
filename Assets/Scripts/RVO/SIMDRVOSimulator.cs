@@ -54,6 +54,12 @@ public class SIMDRVOSimulator
         _agentCount = count;
     }
 
+    public void Reallocate(int count)
+    {
+        if (_agentCount == count) return;
+        Initialize(count);
+    }
+
     public void UpdateAgentData(int index, Vector2 position, Vector2 velocity, Vector2 prefVelocity)
     {
         if (index >= 0 && index < _agentCount)

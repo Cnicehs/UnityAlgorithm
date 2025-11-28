@@ -12,6 +12,8 @@ public class RVODemo : MonoBehaviour
     public float AgentSpeed = 2.0f;
     public bool ShowDebugGizmos = false;
     public SpatialStructureType SpatialIndexType = SpatialStructureType.SIMDKDTree;
+    [Range(1, 200)]
+    public int GridResolution = 40;
     
     private List<GameObject> _agentVisuals = new List<GameObject>();
     private List<Vector2> _positions = new List<Vector2>();
@@ -22,6 +24,7 @@ public class RVODemo : MonoBehaviour
     {
         // Initialize Managers
         SpatialIndexManager.Instance.StructureType = SpatialIndexType;
+        SpatialIndexManager.Instance.GridResolution = GridResolution;
         SpatialIndexManager.Instance.Initialize(AgentCount, WorldSize);
         
         RVOSimulator.Instance.Radius = AgentRadius;
@@ -78,6 +81,16 @@ public class RVODemo : MonoBehaviour
 
     void Update()
     {
+        // Sync Inspector changes to Manager
+        if (SpatialIndexManager.Instance.StructureType != SpatialIndexType)
+        {
+            SpatialIndexManager.Instance.StructureType = SpatialIndexType;
+        }
+        if (SpatialIndexManager.Instance.GridResolution != GridResolution)
+        {
+            SpatialIndexManager.Instance.GridResolution = GridResolution;
+        }
+
         float dt = Time.deltaTime;
 
         if (UseSIMD)
@@ -176,10 +189,36 @@ public class RVODemo : MonoBehaviour
 
     private void OnGUI()
     {
-        GUILayout.BeginArea(new Rect(10, 10, 450, 300));
+        GUILayout.BeginArea(new Rect(10, 10, 450, 400));
         GUILayout.Label($"RVO Demo - {(UseSIMD ? "SIMD" : "Standard")} Mode");
         GUILayout.Label($"Agents: {AgentCount}");
-        GUILayout.Label($"Spatial Index: {SpatialIndexManager.Instance.StructureType}");
+        
+        GUILayout.BeginHorizontal();
+        GUILayout.Label($"Spatial Index: {SpatialIndexManager.Instance.StructureType}", GUILayout.Width(250));
+        if (GUILayout.Button("Change", GUILayout.Width(60)))
+        {
+            var types = (SpatialStructureType[])System.Enum.GetValues(typeof(SpatialStructureType));
+            int current = System.Array.IndexOf(types, SpatialIndexManager.Instance.StructureType);
+            int next = (current + 1) % types.Length;
+            SpatialIndexManager.Instance.StructureType = types[next];
+            SpatialIndexType = types[next];
+        }
+        GUILayout.EndHorizontal();
+
+        if (SpatialIndexManager.Instance.StructureType == SpatialStructureType.Grid ||
+            SpatialIndexManager.Instance.StructureType == SpatialStructureType.SIMDHashGrid)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"Grid Res: {SpatialIndexManager.Instance.GridResolution}", GUILayout.Width(100));
+            float newRes = GUILayout.HorizontalSlider(SpatialIndexManager.Instance.GridResolution, 10, 200);
+            if ((int)newRes != SpatialIndexManager.Instance.GridResolution)
+            {
+                SpatialIndexManager.Instance.GridResolution = (int)newRes;
+                GridResolution = (int)newRes;
+            }
+            GUILayout.EndHorizontal();
+        }
+
         GUILayout.Label($"FPS: {1.0f/Time.smoothDeltaTime:F1}");
         
         GUILayout.Space(10);

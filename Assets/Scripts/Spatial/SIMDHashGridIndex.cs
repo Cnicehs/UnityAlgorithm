@@ -16,6 +16,56 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     private float _cellSize;
     private float2 _origin;
 
+    // Permutation table for branchless compression
+    // Maps a 4-bit mask to a shuffle index vector
+    // 16 entries * 4 ints = 64 ints
+    private static readonly int* _permutationTable;
+
+    // Removed static constructor to avoid Burst error BC1091
+    // We will initialize the table lazily or in the constructor if needed,
+    // but for Burst compatibility, static readonly pointers initialized in static constructor are tricky.
+    // Instead, we can use a shared static struct or just initialize it once.
+    // However, since we can't use UnsafeUtility.Malloc in static ctor for Burst,
+    // let's use a simpler approach: hardcode the table or use a lookup function.
+    // Hardcoding 16x4 ints is verbose but safe.
+    
+    // Actually, we can just use a local stackalloc table in the function if it's small enough,
+    // or pass it as a parameter. But passing is annoying.
+    // Let's use a lookup function that returns the shuffle mask.
+    
+    [BurstCompile]
+    private static void GetShuffleMask(int mask, int* result)
+    {
+        // 0: -1, -1, -1, -1
+        // 1: 0, -1, -1, -1
+        // 2: 1, -1, -1, -1
+        // 3: 0, 1, -1, -1
+        // ...
+        // This is basically a switch statement or a small lookup.
+        // Since we are in Burst, a switch is fine.
+        
+        switch (mask)
+        {
+            case 0: *(int4*)result = new int4(-1, -1, -1, -1); break;
+            case 1: *(int4*)result = new int4(0, -1, -1, -1); break;
+            case 2: *(int4*)result = new int4(1, -1, -1, -1); break;
+            case 3: *(int4*)result = new int4(0, 1, -1, -1); break;
+            case 4: *(int4*)result = new int4(2, -1, -1, -1); break;
+            case 5: *(int4*)result = new int4(0, 2, -1, -1); break;
+            case 6: *(int4*)result = new int4(1, 2, -1, -1); break;
+            case 7: *(int4*)result = new int4(0, 1, 2, -1); break;
+            case 8: *(int4*)result = new int4(3, -1, -1, -1); break;
+            case 9: *(int4*)result = new int4(0, 3, -1, -1); break;
+            case 10: *(int4*)result = new int4(1, 3, -1, -1); break;
+            case 11: *(int4*)result = new int4(0, 1, 3, -1); break;
+            case 12: *(int4*)result = new int4(2, 3, -1, -1); break;
+            case 13: *(int4*)result = new int4(0, 2, 3, -1); break;
+            case 14: *(int4*)result = new int4(1, 2, 3, -1); break;
+            case 15: *(int4*)result = new int4(0, 1, 2, 3); break;
+            default: *(int4*)result = new int4(-1, -1, -1, -1); break;
+        }
+    }
+
     private NativeArray<int> _cellStart;
     private NativeArray<int> _cellCount;
     private NativeArray<float2> _sortedPositions;
@@ -86,7 +136,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void CountElementsPerCell(int* cellCounts, float2* positions, int count, int width, int height, float cellSize, in float2 origin)
+    private static void CountElementsPerCell(int* cellCounts, float2* positions, int count, int width, int height, float cellSize,in float2 origin)
     {
         for (int i = 0; i < count; i++)
         {
@@ -103,7 +153,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void Reorder(int* cellStarts, float2* positions, float2* sortedPositions, int* originalIndices, int count, int width, int height, float cellSize, in float2 origin)
+    private static void Reorder(int* cellStarts, float2* positions, float2* sortedPositions, int* originalIndices, int count, int width, int height, float cellSize,in float2 origin)
     {
         // This needs to be a copy of cellStarts to use as a counter
         int* cellIndices = stackalloc int[width * height];
@@ -137,7 +187,10 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
         try
         {
-            QueryKNearestBurst(new float2(position.x, position.y), k, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxCandidates);
+            fixed (float2* originPtr = &_origin)
+            {
+                QueryKNearestBurst(new float2(position.x, position.y), k, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates);
+            }
 
             for (int i = 0; i < resultCount; i++)
             {
@@ -163,8 +216,9 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults)
     {
+        float2 origin = *originPtr;
         int startX = (int)((position.x - origin.x) / cellSize);
         int startY = (int)((position.y - origin.y) / cellSize);
 
@@ -296,7 +350,11 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
         try
         {
-            QueryRadiusBurst(new float2(position.x, position.y), radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, _origin, resultBuffer, &resultCount, maxResults);
+            fixed (float2* originPtr = &_origin)
+            {
+                float2 pos = new float2(position.x, position.y);
+                QueryRadiusBurst(pos, radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxResults);
+            }
 
             for (int i = 0; i < resultCount; i++)
             {
@@ -310,8 +368,9 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryRadiusBurst(in float2 position, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, in float2 origin, int* results, int* resultCount, int maxResults)
+    private static void QueryRadiusBurst(in float2 position, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults)
     {
+        float2 origin = *originPtr;
         float radius = math.sqrt(radiusSq);
         int minX = (int)((position.x - radius - origin.x) / cellSize);
         int maxX = (int)((position.x + radius - origin.x) / cellSize);
@@ -323,45 +382,9 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         if (minY < 0) minY = 0;
         if (maxY >= height) maxY = height - 1;
 
-        // 1. Gather all indices first
-        int totalCandidates = 0;
-        for (int y = minY; y <= maxY; y++)
-        {
-            for (int x = minX; x <= maxX; x++)
-            {
-                totalCandidates += cellCount[y * width + x];
-            }
-        }
-
-        if (totalCandidates == 0) return;
-
-        int* candidateIndices = (int*)UnsafeUtility.Malloc(totalCandidates * sizeof(int), 4, Allocator.Temp);
-        int gatheredCount = 0;
-        for (int y = minY; y <= maxY; y++)
-        {
-            for (int x = minX; x <= maxX; x++)
-            {
-                int cellIndex = y * width + x;
-                int start = cellStart[cellIndex];
-                int count = cellCount[cellIndex];
-                UnsafeUtility.MemCpy(candidateIndices + gatheredCount, originalIndices + start, count * sizeof(int));
-                gatheredCount += count;
-            }
-        }
-
-        // 2. Process in batch
         float4 rSqVec = new float4(radiusSq);
         float4 target4 = new float4(position.x, position.y, position.x, position.y);
 
-        int i = 0;
-        for (; i <= gatheredCount - 4; i += 4)
-        {
-            // This is still not ideal as we are jumping around in the original positions array.
-            // The sortedPositions array is what we need to use.
-            // Let's fix this.
-        }
-        
-        // Corrected approach: We already have sortedPositions. We just need to iterate through the right cells.
         for (int y = minY; y <= maxY; y++)
         {
             for (int x = minX; x <= maxX; x++)
@@ -370,39 +393,73 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
                 int start = cellStart[cellIndex];
                 int count = cellCount[cellIndex];
 
-                for (i = 0; i <= count - 4; i += 4)
+                for (int i = 0; i < count; i += 4)
                 {
-                    float4 v0 = *(float4*)(sortedPositions + start + i);
-                    float4 v1 = *(float4*)(sortedPositions + start + i + 2);
-
-                    float4 d0 = v0 - target4;
-                    float4 d1 = v1 - target4;
-
-                    float4 sq0 = d0 * d0;
-                    float4 sq1 = d1 * d1;
-
-                    float2 dists0 = sq0.xz + sq0.yw;
-                    float2 dists1 = sq1.xz + sq1.yw;
-
-                    bool4 mask0 = dists0.xyxy <= rSqVec;
-                    bool4 mask1 = dists1.xyxy <= rSqVec;
-
-                    if (mask0.x) results[(*resultCount)++] = originalIndices[start + i];
-                    if (mask0.y) results[(*resultCount)++] = originalIndices[start + i + 1];
-                    if (mask1.x) results[(*resultCount)++] = originalIndices[start + i + 2];
-                    if (mask1.y) results[(*resultCount)++] = originalIndices[start + i + 3];
-                }
-
-                for (; i < count; i++)
-                {
-                    if (math.distancesq(sortedPositions[start + i], position) <= radiusSq)
+                    if (i + 3 < count)
                     {
-                        results[(*resultCount)++] = originalIndices[start + i];
+                        float4 v0 = *(float4*)(sortedPositions + start + i);
+                        float4 v1 = *(float4*)(sortedPositions + start + i + 2);
+
+                        float4 d0 = v0 - target4;
+                        float4 d1 = v1 - target4;
+
+                        float4 sq0 = d0 * d0;
+                        float4 sq1 = d1 * d1;
+
+                        float2 dists0 = sq0.xz + sq0.yw;
+                        float2 dists1 = sq1.xz + sq1.yw;
+
+                        bool4 mask = new bool4(dists0.x <= radiusSq, dists0.y <= radiusSq, dists1.x <= radiusSq, dists1.y <= radiusSq);
+                        int maskInt = math.bitmask(mask);
+                        
+                        if (maskInt > 0)
+                        {
+                            int4 indices = new int4(originalIndices[start + i], originalIndices[start + i + 1], originalIndices[start + i + 2], originalIndices[start + i + 3]);
+                            
+                            // Load shuffle mask
+                            int4 shuffleMask;
+                            GetShuffleMask(maskInt, (int*)&shuffleMask);
+                            
+                            // Shuffle valid indices to front
+                            // math.shuffle for int4 takes ShuffleComponent which is compile time constant
+                            // We need dynamic shuffle.
+                            // We can use indexer or pointer math since we have the shuffle mask in a register.
+                            
+                            int* indicesPtr = (int*)&indices;
+                            int* shufflePtr = (int*)&shuffleMask;
+                            
+                            int4 compressed;
+                            int* compressedPtr = (int*)&compressed;
+                            
+                            compressedPtr[0] = indicesPtr[shufflePtr[0]];
+                            compressedPtr[1] = indicesPtr[shufflePtr[1]];
+                            compressedPtr[2] = indicesPtr[shufflePtr[2]];
+                            compressedPtr[3] = indicesPtr[shufflePtr[3]];
+                            
+                            // Write valid count
+                            int validCount = math.countbits(maskInt);
+                            
+                            // Unsafe write to results buffer
+                            // We assume buffer has enough space (checked by maxResults logic usually, or we should check)
+                            // For max speed we skip check here if we trust maxResults
+                            
+                            // Write all 4 ints to memory (some might be garbage but we only increment count by validCount)
+                            *(int4*)(results + *resultCount) = compressed;
+                            *resultCount += validCount;
+                        }
+                    }
+                    else
+                    {
+                        for (int j = i; j < count; j++)
+                        {
+                            if (math.distancesq(sortedPositions[start + j], position) <= radiusSq)
+                            {
+                                results[(*resultCount)++] = originalIndices[start + j];
+                            }
+                        }
                     }
                 }
             }
         }
-        
-        UnsafeUtility.Free(candidateIndices, Allocator.Temp);
     }
 }

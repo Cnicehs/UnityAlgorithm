@@ -24,6 +24,7 @@ public class SpatialIndexManager
     public static SpatialIndexManager Instance => _instance ??= new SpatialIndexManager();
 
     public SpatialStructureType StructureType = SpatialStructureType.Grid;
+    public int GridResolution = 40;
     public bool UseMultiThreading = true;
     
     public float BuildTimeMs { get; private set; }
@@ -44,6 +45,7 @@ private float _worldSize;
 
     private SpatialStructureType _lastStructureType;
     private int _lastUnitCount;
+    private int _lastGridResolution;
     
     private bool _isRunning;
 
@@ -90,11 +92,12 @@ private float _worldSize;
 
     private void EnsureIndicesCreated()
     {
-        if (_indexA == null || _indexB == null || 
-            _lastStructureType != StructureType || _lastUnitCount != _unitCount)
+        if (_indexA == null || _indexB == null ||
+            _lastStructureType != StructureType || _lastUnitCount != _unitCount || _lastGridResolution != GridResolution)
         {
             _lastStructureType = StructureType;
             _lastUnitCount = _unitCount;
+            _lastGridResolution = GridResolution;
             
             _spatialIndex = null;
             
@@ -109,29 +112,32 @@ _indexB = CreateNewIndex();
     }
 
 ISpatialIndex CreateNewIndex()
+{
+    int res = Mathf.Max(1, GridResolution);
+    float cellSize = _worldSize / res;
+    
+    switch (StructureType)
     {
-        switch (StructureType)
-        {
-            case SpatialStructureType.Grid:
-                return new SpatialGridIndex(40, 40, _worldSize / 40, new Vector2(-_worldSize/2, -_worldSize/2));
-            case SpatialStructureType.KDTree:
-                return new KDTreeIndex(_unitCount);
-            case SpatialStructureType.BVH:
-                return new BVHIndex(_unitCount);
-            case SpatialStructureType.QuadTree:
-                return new QuadTreeIndex(_unitCount, new Rect(-_worldSize/2, -_worldSize/2, _worldSize, _worldSize));
-            case SpatialStructureType.SIMDHashGrid:
-                return new SIMDHashGridIndex(40, 40, _worldSize / 40, new Vector2(-_worldSize/2, -_worldSize/2), _unitCount);
-            case SpatialStructureType.SIMDKDTree:
-                return new SIMDKDTreeIndex(_unitCount);
-            case SpatialStructureType.SIMDBVH:
-                return new SIMDBVHIndex(_unitCount);
-            case SpatialStructureType.SIMDQuadTree:
-                return new SIMDQuadTreeIndex(_unitCount, new Rect(-_worldSize/2, -_worldSize/2, _worldSize, _worldSize));
-            default:
-                return new KDTreeIndex(_unitCount);
-        }
+        case SpatialStructureType.Grid:
+            return new SpatialGridIndex(res, res, cellSize, new Vector2(-_worldSize/2, -_worldSize/2));
+        case SpatialStructureType.KDTree:
+            return new KDTreeIndex(_unitCount);
+        case SpatialStructureType.BVH:
+            return new BVHIndex(_unitCount);
+        case SpatialStructureType.QuadTree:
+            return new QuadTreeIndex(_unitCount, new Rect(-_worldSize/2, -_worldSize/2, _worldSize, _worldSize));
+        case SpatialStructureType.SIMDHashGrid:
+            return new SIMDHashGridIndex(res, res, cellSize, new Vector2(-_worldSize/2, -_worldSize/2), _unitCount);
+        case SpatialStructureType.SIMDKDTree:
+            return new SIMDKDTreeIndex(_unitCount);
+        case SpatialStructureType.SIMDBVH:
+            return new SIMDBVHIndex(_unitCount);
+        case SpatialStructureType.SIMDQuadTree:
+            return new SIMDQuadTreeIndex(_unitCount, new Rect(-_worldSize/2, -_worldSize/2, _worldSize, _worldSize));
+        default:
+            return new KDTreeIndex(_unitCount);
     }
+}
     private async UniTaskVoid BuildLoop()
     {
         while (_isRunning)
