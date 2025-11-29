@@ -160,6 +160,17 @@ public class RVOSimulator
                     _agents[i].Velocity = _agents[i].NewVelocity;
                     _agents[i].Position += _agents[i].Velocity * dt;
                 }
+
+                // 4. Update Spatial Index
+                // We need to sync the spatial index with new positions for the next frame's queries.
+                // Optimization: Avoid creating a new list every frame if possible.
+                // But SpatialIndexManager.UpdatePositions takes List<Vector2>.
+                List<Vector2> allPositions = new List<Vector2>(_agents.Count);
+                for (int i = 0; i < _agents.Count; i++)
+                {
+                    allPositions.Add(_agents[i].Position);
+                }
+                SpatialIndexManager.Instance.UpdatePositions(allPositions);
             }
         }
     }

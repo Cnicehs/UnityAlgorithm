@@ -264,111 +264,93 @@ public static class RVOMath
 
     public static void ConstructObstacleORCALines(RVOAgent agent, List<RVOObstacle> obstacles, float timeStep, List<ORCALine> orcaLines)
     {
-        float invTimeHorizon = 1.0f / agent.TimeHorizon;
+        float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
 
         for (int i = 0; i < obstacles.Count; ++i)
         {
-            RVOObstacle obstacle = obstacles[i];
+            RVOObstacle obst1 = obstacles[i];
+            RVOObstacle obst2 = (obst1.NextObstacle == null) ? obst1 : obst1.NextObstacle;
 
-            // Calculate distance to the line segment
-            float2 relativePosition1 = obstacle.Point1 - agent.Position;
-            float2 relativePosition2 = obstacle.Point2 - agent.Position;
-            float2 obstacleVector = obstacle.Point2 - obstacle.Point1;
-            float obstacleLengthSq = absSq(obstacleVector);
+            float2 relativePosition1 = obst1.Point1 - agent.Position;
+            float2 relativePosition2 = obst2.Point1 - agent.Position;
+            
+            // Check if agent is behind the obstacle line. If so, ignore it.
+            if (det(relativePosition1, obst1.Direction) < 0)
+            {
+                // continue; // This might be too aggressive, let's check distance first.
+            }
 
-            if (obstacleLengthSq == 0) continue;
-
-            float t = math.dot(-relativePosition1, obstacleVector) / obstacleLengthSq;
-            float2 closestPoint;
-
-            if (t < 0) closestPoint = obstacle.Point1;
-            else if (t > 1) closestPoint = obstacle.Point2;
-            else closestPoint = obstacle.Point1 + t * obstacleVector;
-
-            float2 distVec = agent.Position - closestPoint; // Vector FROM obstacle TO agent
-            float distSq = absSq(distVec);
+            float distSq1 = absSq(relativePosition1);
+            float distSq2 = absSq(relativePosition2);
             float radius = agent.Radius;
             float radiusSq = radius * radius;
 
-            // Check if we are behind the obstacle (backface culling)
-            // Normal points OUT. If dot(distVec, Normal) < 0, we are behind/inside.
-            // However, for "thick" walls, being inside means we should be pushed out.
-            // But usually we only collide with the front face.
-            // Let's rely on distance.
-
-            if (distSq > radiusSq * 4.0f && distSq > (agent.TimeHorizon * agent.MaxSpeed + radius) * (agent.TimeHorizon * agent.MaxSpeed + radius))
+            float2 obstacleVector = obst2.Point1 - obst1.Point1;
+            float s = math.dot(-relativePosition1, obstacleVector) / absSq(obstacleVector);
+            
+            // Check if the obstacle is a point (or very short line)
+            if (absSq(obstacleVector) < RVO_EPSILON)
             {
-                // Too far to matter
-                continue;
+                s = -1; // Force it to be treated as a point obstacle (obst1.Point1)
             }
 
+            float distSqLine = distSqPointLineSegment(obst1.Point1, obst2.Point1, agent.Position);
+
             ORCALine line;
-            float2 n = obstacle.Normal;
 
-            // If we are very close or colliding
-            if (distSq < radiusSq)
+            if (distSqLine < radiusSq)
             {
-                // Collision!
-                // Push away immediately.
-                // Constraint: Velocity must be moving away from obstacle.
-                // line.Direction = Tangent
-                // line.Point = 0?
-
-                // We want dot(v, n) >= 0.
-                // Actually we want a stronger push if we are deep inside.
-                // But for now, just forbid moving deeper.
-
-                line.Direction = new float2(-n.y, n.x); // Tangent
-                line.Point = new float2(0, 0); // Pass through origin? 
-
-                // Wait, ORCALine convention:
-                // The allowed half-plane is to the LEFT of the line direction.
-                // If Direction is (-ny, nx), then Normal is (-nx, -ny) = -n.
-                // So allowed side is -n direction? No.
-                // Let's check:
-                // Line Dir D. Normal of line is (-Dy, Dx).
-                // Point P.
-                // dot(x - P, (-Dy, Dx)) > 0
-                // dot(x, (-Dy, Dx)) - dot(P, (-Dy, Dx)) > 0
-
-                // We want dot(v, n) > 0.
-                // So (-Dy, Dx) should be n.
-                // -Dy = nx => Dy = -nx
-                // Dx = ny
-                // So D = (ny, -nx).
-                // Let's verify:
-                // Normal of (ny, -nx) is (-(-nx), ny) = (nx, ny) = n. Correct.
-
-                line.Direction = new float2(n.y, -n.x);
-
-                // If we are colliding, we might want to add a bias to push us out?
-                // For now, just 0 (stop moving in that direction).
-                line.Point = new float2(0, 0);
-
+                // Collision.
+                float invTimeStep = 1.0f / timeStep;
+                float2 normal = normalize(agent.Position - (obst1.Point1 + s * obstacleVector));
+                line.Direction = new float2(normal.y, -normal.x);
+                line.Point = (radius - math.sqrt(distSqLine)) * invTimeStep * normal;
+                line.Point += agent.Velocity; // Add velocity to make it a velocity obstacle
                 orcaLines.Add(line);
                 continue;
             }
 
-            // Not colliding, but close.
-            // We want to ensure we don't hit it within TimeHorizon.
-            // Distance to obstacle is 'dist'.
-            // Max allowed velocity component towards obstacle is (dist - radius) / TimeHorizon.
+            // No collision, create ORCA line for avoidance.
+            float2 w, unit_w;
 
-            float dist = math.sqrt(distSq);
-            float maxVelTowards = (dist - radius) * invTimeHorizon;
-
-            // We want dot(v, -n) <= maxVelTowards
-            // dot(v, n) >= -maxVelTowards
-
-            // Constraint: dot(v, n) >= -maxVelTowards
-            // Line Normal = n.
-            // Line Direction = (ny, -nx).
-            // Point P such that dot(P, n) = -maxVelTowards.
-            // P = -maxVelTowards * n.
-
-            line.Direction = new float2(n.y, -n.x);
-            line.Point = -maxVelTowards * n;
-
+            if (s < 0.0f) // Left of p1
+            {
+                w = agent.Velocity - invTimeHorizonObst * relativePosition1;
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                }
+                else continue; // Already safe
+            }
+            else if (s > 1.0f) // Right of p2
+            {
+                w = agent.Velocity - invTimeHorizonObst * relativePosition2;
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                }
+                else continue; // Already safe
+            }
+            else // Between p1 and p2
+            {
+                w = agent.Velocity - invTimeHorizonObst * (relativePosition1 - s * obstacleVector);
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                }
+                else continue; // Already safe
+            }
+            
+            line.Point += agent.Velocity;
             orcaLines.Add(line);
         }
     }

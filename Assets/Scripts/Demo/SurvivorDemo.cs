@@ -20,8 +20,6 @@ public class SurvivorDemo : MonoBehaviour
     public float EnemyRadius = 0.5f;
     public float PathUpdateInterval = 0.5f;
     public float AttackRange = 1.5f; // Stop when close to player
-    public float SeparationWeight = 1.5f; // Weight for separation steering
-    public float SeparationDist = 1.0f; // Distance to check for separation
 
     [Header("Map")]
     public float CellSize = 1.0f;
@@ -40,24 +38,37 @@ public class SurvivorDemo : MonoBehaviour
     private List<RVOObstacle> _obstacles = new List<RVOObstacle>();
     private List<int> _debugNeighbors = new List<int>();
 
-    private class EnemyUnit
-    {
-        public GameObject GameObject;
-        public int RVOAgentId;
-        public List<Vector2> Path = new List<Vector2>();
-        public int PathIndex;
-        public float NextPathUpdateTime;
-    }
+
 
     void Start()
     {
         InitializeMap();
+
+        // Initialize Pathfinding System EARLY
+        if (GetComponent<PathfindingSystem>() == null) gameObject.AddComponent<PathfindingSystem>();
+        // Note: _nativeObstacles is not created yet? Wait, InitializeMap creates obstacles in GridMap, 
+        // but _nativeObstacles is created in PathfindingSystem.UpdateNativeObstacles.
+        // So we can pass null or let it handle it.
+        // Actually, InitializeMap fills _gridMap.
+        PathfindingSystem.Instance.Initialize(_gridMap, _nativeObstacles, MapWidth, MapHeight, UseSIMDPathfinding);
+
         SpawnPlayer();
         SpawnEnemies();
 
         // Initialize RVO
         RVOSimulator.Instance.ClearAgents();
         RVOSimulator.Instance.ClearObstacles();
+
+        // Tune RVO Global Parameters BEFORE adding agents
+        // (agents copy these values when created)
+        // Parameters are now managed by PathfindingSystem, but initial values for agents need to be set here
+        // or we need to update agents when parameters change.
+        // For now, let's set reasonable defaults here matching PathfindingSystem defaults.
+        RVOSimulator.Instance.NeighborDist = 10.0f;
+        RVOSimulator.Instance.MaxNeighbors = 20;
+        RVOSimulator.Instance.TimeHorizon = 2.0f;
+        RVOSimulator.Instance.Radius = 0.6f;
+        RVOSimulator.Instance.MaxSpeed = Mathf.Max(PlayerSpeed, EnemySpeed) * 1.2f;
 
         // Add obstacles to RVO
         foreach (var obs in _obstacles)
@@ -79,12 +90,6 @@ public class SurvivorDemo : MonoBehaviour
         // Init Spatial Index
         SpatialIndexManager.Instance.StructureType = SpatialStructureType.SIMDQuadTree; // Use robust index
         SpatialIndexManager.Instance.Initialize(EnemyCount + 1, WorldSize);
-
-        // Tune RVO Global Parameters
-        RVOSimulator.Instance.NeighborDist = 10.0f; // Reset to reasonable value
-        RVOSimulator.Instance.MaxNeighbors = 20;
-        RVOSimulator.Instance.TimeHorizon = 1.0f; // Reduced time horizon for tighter packing without overlap
-        RVOSimulator.Instance.Radius = 0.6f; // Slightly larger than visual (0.5) to ensure gap
     }
 
     void FixedUpdate()
@@ -94,34 +99,22 @@ public class SurvivorDemo : MonoBehaviour
         // 1. Player Movement
         UpdatePlayer(dt);
 
-        // 2. Enemy Logic (Pathfinding + Separation)
-        UpdateEnemies(dt);
-
-        // 3. RVO Step
-        List<Vector2> allPositions = new List<Vector2>();
-        for (int i = 0; i < RVOSimulator.Instance.GetAgentCount(); i++)
+        // 2. Pathfinding System (Pipeline) - Handles Enemy Logic and RVO Step
+        if (PathfindingSystem.Instance != null)
         {
-            allPositions.Add(RVOSimulator.Instance.GetAgentPosition(i));
+            PathfindingSystem.Instance.UpdateSystem(dt, _player.transform.position);
         }
-        SpatialIndexManager.Instance.UpdatePositions(allPositions);
 
-        RVOSimulator.Instance.Step(dt);
-
-        // 4. Apply RVO positions to GameObjects
+        // 3. Apply RVO positions to GameObjects
         ApplyPositions();
 
-        // 5. Debug: Query neighbors for debug agent
+        // 4. Debug: Query neighbors for debug agent
         if (ShowDebugGizmos && DebugAgentIndex < RVOSimulator.Instance.GetAgentCount())
         {
-            _debugNeighbors.Clear();
             Vector2 debugPos = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
-            SpatialIndexManager.Instance.GetNeighborsInRadius(debugPos, RVOSimulator.Instance.NeighborDist, _debugNeighbors);
+            _debugNeighbors.Clear();
+            SpatialIndexManager.Instance.GetNeighborsInRadius(debugPos, 5.0f, _debugNeighbors);
         }
-    }
-
-    void Update()
-    {
-        // Only handle input or rendering stuff here if needed
     }
 
     private void InitializeMap()
@@ -201,16 +194,28 @@ public class SurvivorDemo : MonoBehaviour
         Vector2 pMin = minCenter - new Vector2(CellSize * 0.5f, CellSize * 0.5f);
         Vector2 pMax = maxCenter + new Vector2(CellSize * 0.5f, CellSize * 0.5f);
 
-        Vector2 p1 = new Vector2(pMin.x, pMin.y); // Bottom-Left
-        Vector2 p2 = new Vector2(pMax.x, pMin.y); // Bottom-Right
-        Vector2 p3 = new Vector2(pMax.x, pMax.y); // Top-Right
-        Vector2 p4 = new Vector2(pMin.x, pMax.y); // Top-Left
-
         // Add 4 segments for the rectangle
-        _obstacles.Add(new RVOObstacle(p1, p2));
-        _obstacles.Add(new RVOObstacle(p2, p3));
-        _obstacles.Add(new RVOObstacle(p3, p4));
-        _obstacles.Add(new RVOObstacle(p4, p1));
+        // CLOCKWISE Order to ensure Normals point OUTWARD
+        // Normal = (-Dir.y, Dir.x)
+        // If Dir is (1,0) [Right], Normal is (0,1) [Up].
+        // So we want Right -> Down -> Left -> Up?
+        // Let's trace:
+        // Top Edge: Left to Right. Dir=(1,0). Normal=(0,1) UP. Correct.
+        // Right Edge: Top to Bottom. Dir=(0,-1). Normal=(1,0) RIGHT. Correct.
+        // Bottom Edge: Right to Left. Dir=(-1,0). Normal=(0,-1) DOWN. Correct.
+        // Left Edge: Bottom to Top. Dir=(0,1). Normal=(-1,0) LEFT. Correct.
+
+        // So we need: Top-Left -> Top-Right -> Bottom-Right -> Bottom-Left -> Top-Left
+
+        Vector2 pTL = new Vector2(pMin.x, pMax.y);
+        Vector2 pTR = new Vector2(pMax.x, pMax.y);
+        Vector2 pBR = new Vector2(pMax.x, pMin.y);
+        Vector2 pBL = new Vector2(pMin.x, pMin.y);
+
+        _obstacles.Add(new RVOObstacle(pTL, pTR)); // Top
+        _obstacles.Add(new RVOObstacle(pTR, pBR)); // Right
+        _obstacles.Add(new RVOObstacle(pBR, pBL)); // Bottom
+        _obstacles.Add(new RVOObstacle(pBL, pTL)); // Left
     }
 
     private void SpawnPlayer()
@@ -236,8 +241,11 @@ public class SurvivorDemo : MonoBehaviour
 
             EnemyUnit unit = new EnemyUnit();
             unit.GameObject = go;
-            unit.NextPathUpdateTime = Random.Range(0f, PathUpdateInterval);
+            unit.NextPathUpdateTime = Time.time + Random.Range(0f, PathUpdateInterval);
             _enemies.Add(unit);
+
+            // Register with Pathfinding System
+            PathfindingSystem.Instance.RegisterUnit(unit);
         }
 
         Destroy(template);
@@ -259,145 +267,9 @@ public class SurvivorDemo : MonoBehaviour
 
     private void UpdateEnemies(float dt)
     {
-        Vector2 playerPos = RVOSimulator.Instance.GetAgentPosition(0);
-
-        for (int i = 0; i < _enemies.Count; i++)
-        {
-            EnemyUnit unit = _enemies[i];
-
-            // Update Path periodically
-            if (Time.time > unit.NextPathUpdateTime)
-            {
-                unit.NextPathUpdateTime = Time.time + PathUpdateInterval + Random.Range(0f, 0.2f);
-                Vector2 myPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
-
-                // Validate Target & Start
-                Vector2 validTargetPos = GetValidTarget(playerPos);
-                Vector2 validStartPos = GetValidTarget(myPos); // Ensure start is also valid
-
-                // Simple A* to player
-                // Optimization: Don't run A* if line of sight is clear?
-                if (UseSIMDPathfinding)
-                {
-                    Vector2Int startGrid = _gridMap.WorldToGrid(validStartPos);
-                    Vector2Int endGrid = _gridMap.WorldToGrid(validTargetPos);
-
-                    // Allocate max possible path length (map size)
-                    Unity.Collections.NativeArray<Unity.Mathematics.float2> nativePath = new Unity.Collections.NativeArray<Unity.Mathematics.float2>(_gridMap.Width * _gridMap.Height, Unity.Collections.Allocator.Temp);
-                    int pathLength = 0;
-
-                    unsafe
-                    {
-                        SIMDAStarPathfinder.FindPath(
-                            new Unity.Mathematics.int2(startGrid.x, startGrid.y),
-                            new Unity.Mathematics.int2(endGrid.x, endGrid.y),
-                            _gridMap.Width,
-                            _gridMap.Height,
-                            _nativeObstacles,
-                            (float2*)nativePath.GetUnsafePtr(),
-                            ref pathLength,
-                            nativePath.Length,
-                            new Unity.Mathematics.float2(_gridMap.Origin.x, _gridMap.Origin.y),
-                            _gridMap.CellSize
-                        );
-                    }
-
-                    unit.Path.Clear();
-                    for (int k = 0; k < pathLength; k++)
-                    {
-                        unit.Path.Add(new Vector2(nativePath[k].x, nativePath[k].y));
-                    }
-                    nativePath.Dispose();
-                }
-                else
-                {
-                    AStarPathfinder.FindPath(validStartPos, validTargetPos, _gridMap, unit.Path);
-                }
-
-                unit.PathIndex = 0;
-            }
-
-            // Follow Path with Separation
-            Vector2 target = playerPos;
-            bool hasPath = false;
-
-            if (unit.Path != null && unit.Path.Count > 0)
-            {
-                if (unit.PathIndex < unit.Path.Count)
-                {
-                    target = unit.Path[unit.PathIndex];
-                    hasPath = true;
-                    Vector2 myPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
-                    if (Vector2.Distance(myPos, target) < 1.0f)
-                    {
-                        unit.PathIndex++;
-                        if (unit.PathIndex < unit.Path.Count)
-                        {
-                            target = unit.Path[unit.PathIndex];
-                        }
-                    }
-                }
-            }
-
-            Vector2 currentPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
-            float distToPlayer = Vector2.Distance(currentPos, playerPos);
-
-            // 1. Path/Target Force
-            Vector2 moveDir = Vector2.zero;
-            if (distToPlayer > AttackRange)
-            {
-                if (hasPath)
-                {
-                    moveDir = (target - currentPos).normalized;
-                }
-                else
-                {
-                    // No path found? Stop.
-                    // Do NOT move directly to player if pathfinding failed, 
-                    // because it likely means we are blocked or target is invalid.
-                    moveDir = Vector2.zero;
-                }
-            }
-
-            // 2. Separation Force
-            Vector2 separationForce = Vector2.zero;
-            if (SeparationWeight > 0)
-            {
-                List<int> neighbors = new List<int>();
-                SpatialIndexManager.Instance.GetNeighborsInRadius(currentPos, SeparationDist, neighbors);
-
-                foreach (int neighborIdx in neighbors)
-                {
-                    if (neighborIdx == unit.RVOAgentId) continue;
-
-                    Vector2 neighborPos = RVOSimulator.Instance.GetAgentPosition(neighborIdx);
-                    Vector2 toNeighbor = currentPos - neighborPos;
-                    float distSq = toNeighbor.sqrMagnitude;
-
-                    if (distSq > 0.001f)
-                    {
-                        separationForce += toNeighbor.normalized / Mathf.Sqrt(distSq);
-                    }
-                }
-            }
-
-            // Combine
-            Vector2 finalDir = (moveDir + separationForce * SeparationWeight).normalized;
-
-            // If close to player and separation is pushing us, we might still move.
-            // But if we are close enough, we should mostly stop or just separate slightly.
-            if (distToPlayer <= AttackRange && moveDir == Vector2.zero)
-            {
-                // Only separation applies
-                finalDir = separationForce.normalized;
-                // Reduce speed when just separating?
-                RVOSimulator.Instance.SetAgentPrefVelocity(unit.RVOAgentId, finalDir * EnemySpeed * 0.5f);
-            }
-            else
-            {
-                RVOSimulator.Instance.SetAgentPrefVelocity(unit.RVOAgentId, finalDir * EnemySpeed);
-            }
-        }
+        // This logic is now handled by PathfindingSystem.UpdateSystem
+        // The PathfindingSystem will call GetValidTarget and update unit paths.
+        // It will also set the RVO preferred velocity for each enemy.
     }
 
     private void ApplyPositions()
@@ -565,41 +437,10 @@ public class SurvivorDemo : MonoBehaviour
         GUILayout.EndArea();
     }
 
-    private Vector2 GetValidTarget(Vector2 targetPos)
-    {
-        Vector2Int gridPos = _gridMap.WorldToGrid(targetPos);
-        if (!_gridMap.IsObstacle(gridPos.x, gridPos.y))
-        {
-            return targetPos;
-        }
-
-        // Spiral search for nearest walkable
-        int radius = 1;
-        while (radius < 10) // Limit search
-        {
-            for (int x = -radius; x <= radius; x++)
-            {
-                for (int y = -radius; y <= radius; y++)
-                {
-                    if (Mathf.Abs(x) == radius || Mathf.Abs(y) == radius)
-                    {
-                        int checkX = gridPos.x + x;
-                        int checkY = gridPos.y + y;
-                        if (!_gridMap.IsObstacle(checkX, checkY))
-                        {
-                            return _gridMap.GridToWorld(checkX, checkY);
-                        }
-                    }
-                }
-            }
-            radius++;
-        }
-
-        return targetPos; // Give up
-    }
-
+    // GetValidTarget moved to PathfindingSystem
+    // OnDestroy handled by PathfindingSystem for native obstacles
     private void OnDestroy()
     {
-        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
+        // Cleanup if needed
     }
 }

@@ -8,7 +8,7 @@ public class GridMap
     public float CellSize { get; private set; }
     public Vector2 Origin { get; private set; }
 
-    private bool[,] _obstacles;
+    public bool[,] Obstacles { get; private set; }
 
     public GridMap(int width, int height, float cellSize, Vector2 origin)
     {
@@ -16,21 +16,21 @@ public class GridMap
         Height = height;
         CellSize = cellSize;
         Origin = origin;
-        _obstacles = new bool[width, height];
+        Obstacles = new bool[width, height];
     }
 
     public void SetObstacle(int x, int y, bool isObstacle)
     {
         if (IsValid(x, y))
         {
-            _obstacles[x, y] = isObstacle;
+            Obstacles[x, y] = isObstacle;
         }
     }
 
     public bool IsObstacle(int x, int y)
     {
         if (!IsValid(x, y)) return true; // Out of bounds is obstacle
-        return _obstacles[x, y];
+        return Obstacles[x, y];
     }
 
     public bool IsValid(int x, int y)
@@ -49,9 +49,9 @@ public class GridMap
     {
         return new Vector2(x * CellSize + CellSize * 0.5f, y * CellSize + CellSize * 0.5f) + Origin;
     }
-    
+
     public void Clear()
     {
-        System.Array.Clear(_obstacles, 0, _obstacles.Length);
+        System.Array.Clear(Obstacles, 0, Obstacles.Length);
     }
 }
