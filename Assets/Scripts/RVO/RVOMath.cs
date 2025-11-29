@@ -403,8 +403,46 @@ public static class RVOMath
                 continue;
             }
 
-            // No collision - TEMPORARILY REMOVED TO TEST COLLISION DETECTION
-            // TODO: Implement proper No Collision ORCA lines based on RVO2 reference
+            // No collision
+            if (s < 0.0f)
+            {
+                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition1;
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    float2 unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                    line.Point += agent.Velocity;
+                    orcaLines.Add(line);
+                }
+            }
+            else if (s > 1.0f)
+            {
+                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition2;
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    float2 unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                    line.Point += agent.Velocity;
+                    orcaLines.Add(line);
+                }
+            }
+            else
+            {
+                float2 w = agent.Velocity - invTimeHorizonObst * (relativePosition1 - s * obstacleVector);
+                float w_sq = absSq(w);
+                if (w_sq > radiusSq)
+                {
+                    float2 unit_w = math.normalize(w);
+                    line.Direction = new float2(unit_w.y, -unit_w.x);
+                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
+                    line.Point += agent.Velocity;
+                    orcaLines.Add(line);
+                }
+            }
         }
     }
 }
