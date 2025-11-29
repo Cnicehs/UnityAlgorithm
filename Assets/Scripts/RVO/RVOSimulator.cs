@@ -20,7 +20,6 @@ public class RVOSimulator
     public float PositionUpdateTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.PositionUpdate");
     public float TotalStepTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.Step");
 
-    private const float ObstacleLinkEpsilon = 0.05f;
     private const float PenetrationPadding = 0.001f;
 
     private List<RVOAgent> _agents = new List<RVOAgent>();
@@ -29,7 +28,6 @@ public class RVOSimulator
     private List<RVOAgent> _neighbors = new List<RVOAgent>();
     private List<Vector2> _cachedPositions = new List<Vector2>();
     private bool _obstaclesDirty = false;
-    private bool _spatialIndexDirty = true;
 
     private RVOSimulator()
     {
@@ -45,7 +43,6 @@ public class RVOSimulator
         agent.TimeHorizon = TimeHorizon;
         agent.TimeHorizonObst = TimeHorizonObst;
         _agents.Add(agent);
-        _spatialIndexDirty = true;
     }
 
     public bool RemoveAgent(int agentIndex)
@@ -60,14 +57,12 @@ public class RVOSimulator
         {
             _agents[i].ID = i;
         }
-        _spatialIndexDirty = true;
         return true;
     }
 
     public void ClearAgents()
     {
         _agents.Clear();
-        _spatialIndexDirty = true;
     }
 
     public void SetAgentPrefVelocity(int i, Vector3 prefVel)
@@ -110,10 +105,12 @@ public class RVOSimulator
         return _obstacles;
     }
 
-    public void AddObstacle(Vector3 p1, Vector3 p2)
+    public RVOObstacle AddObstacle(Vector3 p1, Vector3 p2)
     {
-        _obstacles.Add(new RVOObstacle(new float2(p1.x, p1.z), new float2(p2.x, p2.z)));
+        RVOObstacle obstacle = new RVOObstacle(new float2(p1.x, p1.z), new float2(p2.x, p2.z));
+        _obstacles.Add(obstacle);
         _obstaclesDirty = true;
+        return obstacle;
     }
 
     public void ClearObstacles()
@@ -134,85 +131,23 @@ public class RVOSimulator
         return true;
     }
 
+    public bool RemoveObstacle(RVOObstacle obstacle)
+    {
+        if (obstacle == null)
+        {
+            return false;
+        }
+
+        bool removed = _obstacles.Remove(obstacle);
+        if (removed)
+        {
+            _obstaclesDirty = true;
+        }
+        return removed;
+    }
+
     public void ProcessObstacles()
     {
-        if (_obstacles.Count == 0)
-        {
-            _obstaclesDirty = false;
-            return;
-        }
-
-        for (int i = 0; i < _obstacles.Count; i++)
-        {
-            _obstacles[i].NextObstacle = null;
-            _obstacles[i].PrevObstacle = null;
-        }
-
-        Dictionary<Vector2Int, List<RVOObstacle>> startLookup = new Dictionary<Vector2Int, List<RVOObstacle>>(_obstacles.Count);
-        float linkThresholdSq = ObstacleLinkEpsilon * ObstacleLinkEpsilon;
-
-        for (int i = 0; i < _obstacles.Count; i++)
-        {
-            Vector2Int key = QuantizePoint(_obstacles[i].Point1);
-            if (!startLookup.TryGetValue(key, out List<RVOObstacle> list))
-            {
-                list = new List<RVOObstacle>();
-                startLookup[key] = list;
-            }
-            list.Add(_obstacles[i]);
-        }
-
-        for (int i = 0; i < _obstacles.Count; i++)
-        {
-            RVOObstacle obstacle = _obstacles[i];
-            Vector2Int endKey = QuantizePoint(obstacle.Point2);
-            if (!startLookup.TryGetValue(endKey, out List<RVOObstacle> candidates))
-            {
-                continue;
-            }
-
-            RVOObstacle best = null;
-            float bestDistSq = float.MaxValue;
-            for (int j = 0; j < candidates.Count; j++)
-            {
-                RVOObstacle candidate = candidates[j];
-                if (candidate == obstacle)
-                {
-                    continue;
-                }
-
-                float distSq = math.lengthsq(obstacle.Point2 - candidate.Point1);
-                if (distSq <= linkThresholdSq && distSq < bestDistSq)
-                {
-                    best = candidate;
-                    bestDistSq = distSq;
-                }
-            }
-
-            if (best != null)
-            {
-                obstacle.NextObstacle = best;
-                best.PrevObstacle = obstacle;
-            }
-        }
-
-        // 2. Calculate Convexity
-        for (int i = 0; i < _obstacles.Count; ++i)
-        {
-            RVOObstacle obst = _obstacles[i];
-            RVOObstacle prev = obst.PrevObstacle;
-            RVOObstacle next = obst.NextObstacle;
-
-            if (prev != null && next != null)
-            {
-                obst.IsConvex = RVOMath.LeftOf(prev.Point1, obst.Point1, next.Point1) >= 0.0f;
-            }
-            else
-            {
-                obst.IsConvex = true;
-            }
-        }
-
         _obstaclesDirty = false;
     }
 
@@ -318,15 +253,6 @@ public class RVOSimulator
                 SpatialIndexManager.Instance.UpdatePositions(_cachedPositions);
             }
         }
-    }
-
-    private Vector2Int QuantizePoint(float2 point)
-    {
-        float quantizationScale = 1.0f / ObstacleLinkEpsilon;
-        return new Vector2Int(
-            Mathf.RoundToInt(point.x * quantizationScale),
-            Mathf.RoundToInt(point.y * quantizationScale)
-        );
     }
 
     private void SeparateOverlappingAgents()
