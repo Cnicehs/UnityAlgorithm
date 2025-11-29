@@ -52,11 +52,12 @@ public class RVOoBSDemo : MonoBehaviour
         _obstacleVisual.GetComponent<Renderer>().material.color = Color.red;
         Destroy(_obstacleVisual.GetComponent<Collider>()); // Remove physics collider
 
-        // Add to RVO simulator
-        RVOSimulator.Instance.AddObstacle(new Vector3(pTL.x, 0, pTL.y), new Vector3(pTR.x, 0, pTR.y)); // Top
-        RVOSimulator.Instance.AddObstacle(new Vector3(pTR.x, 0, pTR.y), new Vector3(pBR.x, 0, pBR.y)); // Right
-        RVOSimulator.Instance.AddObstacle(new Vector3(pBR.x, 0, pBR.y), new Vector3(pBL.x, 0, pBL.y)); // Bottom
-        RVOSimulator.Instance.AddObstacle(new Vector3(pBL.x, 0, pBL.y), new Vector3(pTL.x, 0, pTL.y)); // Left
+        // Add to RVO simulator - COUNTER-CLOCKWISE order (RVO2 requirement)
+        // CCW ensures -obstacle.Direction creates correct blocking constraints
+        RVOSimulator.Instance.AddObstacle(new Vector3(pTL.x, 0, pTL.y), new Vector3(pBL.x, 0, pBL.y)); // Left
+        RVOSimulator.Instance.AddObstacle(new Vector3(pBL.x, 0, pBL.y), new Vector3(pBR.x, 0, pBR.y)); // Bottom
+        RVOSimulator.Instance.AddObstacle(new Vector3(pBR.x, 0, pBR.y), new Vector3(pTR.x, 0, pTR.y)); // Right
+        RVOSimulator.Instance.AddObstacle(new Vector3(pTR.x, 0, pTR.y), new Vector3(pTL.x, 0, pTL.y)); // Top
 
         RVOSimulator.Instance.ProcessObstacles();
 

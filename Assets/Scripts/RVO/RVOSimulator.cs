@@ -221,7 +221,8 @@ public class RVOSimulator
 
                     if (lineFail < _orcaLines.Count)
                     {
-                        RVOMath.linearProgram3(_orcaLines, 0, lineFail, agent.MaxSpeed, ref newVel);
+                        // Pass obstacleORCACount so collision constraints (point=(0,0)) are treated as HARD constraints
+                        RVOMath.linearProgram3(_orcaLines, obstacleORCACount, lineFail, agent.MaxSpeed, ref newVel);
                     }
 
                     agent.NewVelocity = newVel;

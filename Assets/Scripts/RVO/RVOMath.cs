@@ -226,7 +226,7 @@ public static class RVOMath
 
     public static void ConstructORCALines(RVOAgent agent, List<RVOAgent> neighbors, float timeStep, List<ORCALine> orcaLines)
     {
-        orcaLines.Clear();
+        // DO NOT CLEAR - obstacle lines were already added!
         float invTimeHorizon = 1.0f / agent.TimeHorizon;
 
         for (int i = 0; i < neighbors.Count; ++i)
@@ -298,6 +298,12 @@ public static class RVOMath
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
         int linesAdded = 0;
+        bool debugLog = Time.frameCount % 120 == 0;
+
+        if (debugLog)
+        {
+            Debug.Log($"[ObstORCA] Agent pos: {agent.Position}, vel: {agent.Velocity}, obstacles: {obstacles.Count}");
+        }
 
         for (int i = 0; i < obstacles.Count; ++i)
         {
@@ -308,6 +314,11 @@ public static class RVOMath
             float2 p2 = (obst2 != null) ? obst2.Point1 : obst1.Point2;
             float2 relativePosition1 = obst1.Point1 - agent.Position;
             float2 relativePosition2 = p2 - agent.Position;
+
+            if (debugLog)
+            {
+                Debug.Log($"[ObstORCA {i}] P1: {obst1.Point1}, P2: {p2}, Dir: {obst1.Direction}, Normal: {obst1.Normal}");
+            }
 
             // Check if agent is behind the obstacle line. If so, ignore it.
             // Only if convex.
@@ -375,88 +386,25 @@ public static class RVOMath
             else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
             {
                 // Collision with line segment
-                // ORCA linearProgram2 REJECTS when det(Direction, Point - result) > 0
-                // This means it rejects LEFT side, permits RIGHT side (det <= 0)
-                // We want agents on Normal (OUTWARD) side
-                // Normal is LEFT of obst.Direction
-                // So we need permitted region (RIGHT of line.Direction) = Normal side
-                // RIGHT of line.Direction = LEFT of obst.Direction
-                // Therefore line.Direction = -obst.Direction
+                if (debugLog)
+                {
+                    Debug.Log($"[ObstORCA {i}] COLLISION! s={s:F3}, distSqLine={distSqLine:F3}, radiusSq={radiusSq:F3}");
+                }
 
-                float2 n = obst1.Normal; // Points OUT
-                line.Direction = -obst1.Direction; // RIGHT of this is Normal (OUT)
-                line.Point = (radius - math.sqrt(distSqLine)) * invTimeHorizonObst * n;
-                line.Point += agent.Velocity;
-                orcaLines.Add(line);
-                continue;
-            }
-
-            // No collision
-
-            if (s < 0.0f && !obst1.IsConvex)
-            {
-                continue;
-            }
-            if (s > 1.0f)
-            {
-                bool nextIsConvex = (obst2 != null) ? obst2.IsConvex : true;
-                if (!nextIsConvex) continue;
-            }
-
-            if (s >= 0.0f && s <= 1.0f)
-            {
-                // Same logic: permitted region is RIGHT of line.Direction
+                // RVO2-Unity reference: collision constraints use point=(0,0) and direction=-obstacle.Direction
+                line.Point = new float2(0.0f, 0.0f);
                 line.Direction = -obst1.Direction;
-            }
-            else if (s < 0.0f)
-            {
-                line.Direction = normalize(new float2(-relativePosition1.y, relativePosition1.x));
-            }
-            else
-            {
-                line.Direction = normalize(new float2(-relativePosition2.y, relativePosition2.x));
+                orcaLines.Add(line);
+
+                if (debugLog)
+                {
+                    Debug.Log($"[ObstORCA {i}] Added collision line: Dir={line.Direction}, Point={line.Point}");
+                }
+                continue;
             }
 
-            // Correct implementation of the "No Collision" case from RVO2
-            if (s < 0.0f)
-            {
-                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition1;
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
-                {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                }
-                else continue;
-            }
-            else if (s > 1.0f)
-            {
-                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition2;
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
-                {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                }
-                else continue;
-            }
-            else
-            {
-                float2 w = agent.Velocity - invTimeHorizonObst * (relativePosition1 - s * obstacleVector);
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
-                {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                }
-                else continue;
-            }
-
-            line.Point += agent.Velocity;
-            orcaLines.Add(line);
+            // No collision - TEMPORARILY REMOVED TO TEST COLLISION DETECTION
+            // TODO: Implement proper No Collision ORCA lines based on RVO2 reference
         }
     }
 }
