@@ -153,18 +153,64 @@ public class SurvivorDemo : MonoBehaviour
 
     private void CreateWall(Vector2 start, Vector2 end)
     {
-        // Add to RVO
-        _obstacles.Add(new RVOObstacle(start, end));
+        // Track grid bounds
+        int minX = int.MaxValue;
+        int minY = int.MaxValue;
+        int maxX = int.MinValue;
+        int maxY = int.MinValue;
 
         // Add to GridMap (Rasterize line)
         Vector2 dir = (end - start).normalized;
         float dist = Vector2.Distance(start, end);
+
+        // Ensure we cover the start and end points exactly
+        // And step small enough to hit all cells
         for (float d = 0; d <= dist; d += CellSize * 0.5f)
         {
             Vector2 p = start + dir * d;
             Vector2Int gridPos = _gridMap.WorldToGrid(p);
             _gridMap.SetObstacle(gridPos.x, gridPos.y, true);
+
+            if (gridPos.x < minX) minX = gridPos.x;
+            if (gridPos.y < minY) minY = gridPos.y;
+            if (gridPos.x > maxX) maxX = gridPos.x;
+            if (gridPos.y > maxY) maxY = gridPos.y;
         }
+
+        // Also check the exact end point to be sure (floating point errors)
+        {
+            Vector2Int gridPos = _gridMap.WorldToGrid(end);
+            _gridMap.SetObstacle(gridPos.x, gridPos.y, true);
+            if (gridPos.x < minX) minX = gridPos.x;
+            if (gridPos.y < minY) minY = gridPos.y;
+            if (gridPos.x > maxX) maxX = gridPos.x;
+            if (gridPos.y > maxY) maxY = gridPos.y;
+        }
+
+        // Add to RVO as a "Thick" Wall (Rectangle) derived from Grid Bounds
+        // This ensures perfect alignment with the visual red cubes.
+
+        // GridToWorld returns the CENTER of the cell.
+        // We want the outer edges.
+        // Bottom-Left of min cell: Center - 0.5*Size
+        // Top-Right of max cell: Center + 0.5*Size
+
+        Vector2 minCenter = _gridMap.GridToWorld(minX, minY);
+        Vector2 maxCenter = _gridMap.GridToWorld(maxX, maxY);
+
+        Vector2 pMin = minCenter - new Vector2(CellSize * 0.5f, CellSize * 0.5f);
+        Vector2 pMax = maxCenter + new Vector2(CellSize * 0.5f, CellSize * 0.5f);
+
+        Vector2 p1 = new Vector2(pMin.x, pMin.y); // Bottom-Left
+        Vector2 p2 = new Vector2(pMax.x, pMin.y); // Bottom-Right
+        Vector2 p3 = new Vector2(pMax.x, pMax.y); // Top-Right
+        Vector2 p4 = new Vector2(pMin.x, pMax.y); // Top-Left
+
+        // Add 4 segments for the rectangle
+        _obstacles.Add(new RVOObstacle(p1, p2));
+        _obstacles.Add(new RVOObstacle(p2, p3));
+        _obstacles.Add(new RVOObstacle(p3, p4));
+        _obstacles.Add(new RVOObstacle(p4, p1));
     }
 
     private void SpawnPlayer()
@@ -225,13 +271,16 @@ public class SurvivorDemo : MonoBehaviour
                 unit.NextPathUpdateTime = Time.time + PathUpdateInterval + Random.Range(0f, 0.2f);
                 Vector2 myPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
 
+                // Validate Target & Start
+                Vector2 validTargetPos = GetValidTarget(playerPos);
+                Vector2 validStartPos = GetValidTarget(myPos); // Ensure start is also valid
+
                 // Simple A* to player
                 // Optimization: Don't run A* if line of sight is clear?
-                // Simple A* to player
                 if (UseSIMDPathfinding)
                 {
-                    Vector2Int startGrid = _gridMap.WorldToGrid(myPos);
-                    Vector2Int endGrid = _gridMap.WorldToGrid(playerPos);
+                    Vector2Int startGrid = _gridMap.WorldToGrid(validStartPos);
+                    Vector2Int endGrid = _gridMap.WorldToGrid(validTargetPos);
 
                     // Allocate max possible path length (map size)
                     Unity.Collections.NativeArray<Unity.Mathematics.float2> nativePath = new Unity.Collections.NativeArray<Unity.Mathematics.float2>(_gridMap.Width * _gridMap.Height, Unity.Collections.Allocator.Temp);
@@ -252,7 +301,7 @@ public class SurvivorDemo : MonoBehaviour
                             _gridMap.CellSize
                         );
                     }
-                    
+
                     unit.Path.Clear();
                     for (int k = 0; k < pathLength; k++)
                     {
@@ -262,9 +311,9 @@ public class SurvivorDemo : MonoBehaviour
                 }
                 else
                 {
-                    AStarPathfinder.FindPath(myPos, playerPos, _gridMap, unit.Path);
+                    AStarPathfinder.FindPath(validStartPos, validTargetPos, _gridMap, unit.Path);
                 }
-                
+
                 unit.PathIndex = 0;
             }
 
@@ -297,7 +346,17 @@ public class SurvivorDemo : MonoBehaviour
             Vector2 moveDir = Vector2.zero;
             if (distToPlayer > AttackRange)
             {
-                moveDir = (target - currentPos).normalized;
+                if (hasPath)
+                {
+                    moveDir = (target - currentPos).normalized;
+                }
+                else
+                {
+                    // No path found? Stop.
+                    // Do NOT move directly to player if pathfinding failed, 
+                    // because it likely means we are blocked or target is invalid.
+                    moveDir = Vector2.zero;
+                }
             }
 
             // 2. Separation Force
@@ -355,16 +414,22 @@ public class SurvivorDemo : MonoBehaviour
     {
         if (_gridMap != null)
         {
-            // Draw Obstacles (Red)
-            Gizmos.color = new Color(1, 0, 0, 0.3f);
+            // Draw Grid
+            Gizmos.color = new Color(0.5f, 0.5f, 0.5f, 0.1f); // Faint grey
             for (int x = 0; x < _gridMap.Width; x++)
             {
                 for (int y = 0; y < _gridMap.Height; y++)
                 {
+                    Vector2 pos = _gridMap.GridToWorld(x, y);
                     if (_gridMap.IsObstacle(x, y))
                     {
-                        Vector2 pos = _gridMap.GridToWorld(x, y);
+                        Gizmos.color = new Color(1, 0, 0, 0.3f); // Red obstacle
                         Gizmos.DrawCube(new Vector3(pos.x, pos.y, 0), Vector3.one * _gridMap.CellSize);
+                    }
+                    else
+                    {
+                        Gizmos.color = new Color(0.5f, 0.5f, 0.5f, 0.1f); // Walkable
+                        Gizmos.DrawWireCube(new Vector3(pos.x, pos.y, 0), Vector3.one * _gridMap.CellSize);
                     }
                 }
             }
@@ -375,7 +440,14 @@ public class SurvivorDemo : MonoBehaviour
             Gizmos.color = Color.blue;
             foreach (var obs in _obstacles)
             {
-                Gizmos.DrawLine(new Vector3(obs.Point1.x, obs.Point1.y, 0), new Vector3(obs.Point2.x, obs.Point2.y, 0));
+                Vector3 p1 = new Vector3(obs.Point1.x, obs.Point1.y, 0);
+                Vector3 p2 = new Vector3(obs.Point2.x, obs.Point2.y, 0);
+                Gizmos.DrawLine(p1, p2);
+
+                // Draw Normal to show orientation
+                Vector3 mid = (p1 + p2) * 0.5f;
+                Vector3 normal = new Vector3(obs.Normal.x, obs.Normal.y, 0);
+                Gizmos.DrawLine(mid, mid + normal * 0.3f);
             }
         }
 
@@ -419,6 +491,25 @@ public class SurvivorDemo : MonoBehaviour
                     Vector3 neighborPos3D = new Vector3(neighborPos.x, neighborPos.y, 0);
                     Gizmos.DrawLine(debugPos3D, neighborPos3D);
                     Gizmos.DrawWireSphere(neighborPos3D, RVOSimulator.Instance.Radius);
+                }
+            }
+
+            // Draw Path for Debug Agent
+            // Find the EnemyUnit corresponding to this RVO agent
+            var unit = _enemies.Find(e => e.RVOAgentId == DebugAgentIndex);
+            if (unit != null && unit.Path != null && unit.Path.Count > 0)
+            {
+                Gizmos.color = Color.magenta;
+                for (int j = 0; j < unit.Path.Count - 1; j++)
+                {
+                    Vector3 p1 = new Vector3(unit.Path[j].x, unit.Path[j].y, 0);
+                    Vector3 p2 = new Vector3(unit.Path[j + 1].x, unit.Path[j + 1].y, 0);
+                    Gizmos.DrawLine(p1, p2);
+                }
+                // Draw line to current target
+                if (unit.PathIndex < unit.Path.Count)
+                {
+                    Gizmos.DrawLine(debugPos3D, new Vector3(unit.Path[unit.PathIndex].x, unit.Path[unit.PathIndex].y, 0));
                 }
             }
 
@@ -472,6 +563,39 @@ public class SurvivorDemo : MonoBehaviour
         }
 
         GUILayout.EndArea();
+    }
+
+    private Vector2 GetValidTarget(Vector2 targetPos)
+    {
+        Vector2Int gridPos = _gridMap.WorldToGrid(targetPos);
+        if (!_gridMap.IsObstacle(gridPos.x, gridPos.y))
+        {
+            return targetPos;
+        }
+
+        // Spiral search for nearest walkable
+        int radius = 1;
+        while (radius < 10) // Limit search
+        {
+            for (int x = -radius; x <= radius; x++)
+            {
+                for (int y = -radius; y <= radius; y++)
+                {
+                    if (Mathf.Abs(x) == radius || Mathf.Abs(y) == radius)
+                    {
+                        int checkX = gridPos.x + x;
+                        int checkY = gridPos.y + y;
+                        if (!_gridMap.IsObstacle(checkX, checkY))
+                        {
+                            return _gridMap.GridToWorld(checkX, checkY);
+                        }
+                    }
+                }
+            }
+            radius++;
+        }
+
+        return targetPos; // Give up
     }
 
     private void OnDestroy()
