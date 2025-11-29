@@ -93,7 +93,10 @@ public class PathfindingSystem : MonoBehaviour
             if (Time.time > unit.NextPathUpdateTime)
             {
                 unit.NextPathUpdateTime = Time.time + PathUpdateInterval + UnityEngine.Random.Range(0f, 0.2f);
-                Vector2 unitPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
+
+                Vector3 agentPos3D = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
+                Vector2 unitPos = new Vector2(agentPos3D.x, agentPos3D.z);
+
                 Vector2 validStartPos = GetValidTarget(unitPos);
                 Vector2Int startGrid = GridMap.WorldToGrid(validStartPos);
 
@@ -143,7 +146,9 @@ public class PathfindingSystem : MonoBehaviour
 
         foreach (var unit in _units)
         {
-            Vector2 currentPos = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
+            Vector3 agentPos3D = RVOSimulator.Instance.GetAgentPosition(unit.RVOAgentId);
+            Vector2 currentPos = new Vector2(agentPos3D.x, agentPos3D.z);
+
             float distToPlayerSq = (playerPos - currentPos).sqrMagnitude;
 
             Vector2 moveDir = Vector2.zero;
@@ -168,7 +173,7 @@ public class PathfindingSystem : MonoBehaviour
                     }
 
                     Vector2 target = unit.Path[unit.PathIndex];
-                    
+
                     // Add Jitter to target to prevent overlap
                     // Use agent ID to make it deterministic but different per agent
                     // Or just random? Random might cause jittering movement.
@@ -176,9 +181,9 @@ public class PathfindingSystem : MonoBehaviour
                     float jitterAmount = 0.2f;
                     float angle = (unit.AgentId * 137.5f) * Mathf.Deg2Rad; // Golden angle
                     Vector2 jitter = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * jitterAmount;
-                    
+
                     Vector2 targetWithJitter = target + jitter;
-                    
+
                     moveDir = (targetWithJitter - currentPos).normalized;
                 }
             }
@@ -186,15 +191,15 @@ public class PathfindingSystem : MonoBehaviour
             // Apply to RVO
             float speed = 3.0f; // Default enemy speed
             Vector2 prefVel = moveDir * speed;
-            
+
             // Clamp to max speed (though normalized * speed is already clamped if speed <= maxSpeed)
             // But just in case
             if (prefVel.sqrMagnitude > speed * speed)
             {
                 prefVel = prefVel.normalized * speed;
             }
-            
-            RVOSimulator.Instance.SetAgentPrefVelocity(unit.RVOAgentId, prefVel);
+
+            RVOSimulator.Instance.SetAgentPrefVelocity(unit.RVOAgentId, new Vector3(prefVel.x, 0, prefVel.y));
         }
     }
 

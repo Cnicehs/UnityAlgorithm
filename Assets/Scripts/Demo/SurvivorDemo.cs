@@ -73,17 +73,17 @@ public class SurvivorDemo : MonoBehaviour
         // Add obstacles to RVO
         foreach (var obs in _obstacles)
         {
-            RVOSimulator.Instance.AddObstacle(obs.Point1, obs.Point2);
+            RVOSimulator.Instance.AddObstacle(new Vector3(obs.Point1.x, 0, obs.Point1.y), new Vector3(obs.Point2.x, 0, obs.Point2.y));
         }
 
         // Add Player to RVO (as agent 0)
-        RVOSimulator.Instance.AddAgent((Vector2)_player.transform.position);
-        RVOSimulator.Instance.SetAgentPrefVelocity(0, Vector2.zero);
+        RVOSimulator.Instance.AddAgent(_player.transform.position);
+        RVOSimulator.Instance.SetAgentPrefVelocity(0, Vector3.zero);
 
         // Add Enemies to RVO
         for (int i = 0; i < _enemies.Count; i++)
         {
-            RVOSimulator.Instance.AddAgent((Vector2)_enemies[i].GameObject.transform.position);
+            RVOSimulator.Instance.AddAgent(_enemies[i].GameObject.transform.position);
             _enemies[i].RVOAgentId = i + 1; // +1 because 0 is player
         }
 
@@ -102,7 +102,8 @@ public class SurvivorDemo : MonoBehaviour
         // 2. Pathfinding System (Pipeline) - Handles Enemy Logic and RVO Step
         if (PathfindingSystem.Instance != null)
         {
-            PathfindingSystem.Instance.UpdateSystem(dt, _player.transform.position);
+            Vector3 pPos = _player.transform.position;
+            PathfindingSystem.Instance.UpdateSystem(dt, new Vector2(pPos.x, pPos.z));
         }
 
         // 3. Apply RVO positions to GameObjects
@@ -111,7 +112,8 @@ public class SurvivorDemo : MonoBehaviour
         // 4. Debug: Query neighbors for debug agent
         if (ShowDebugGizmos && DebugAgentIndex < RVOSimulator.Instance.GetAgentCount())
         {
-            Vector2 debugPos = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
+            Vector3 debugPos3D = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
+            float2 debugPos = new float2(debugPos3D.x, debugPos3D.z);
             _debugNeighbors.Clear();
             SpatialIndexManager.Instance.GetNeighborsInRadius(debugPos, 5.0f, _debugNeighbors);
         }
@@ -235,7 +237,8 @@ public class SurvivorDemo : MonoBehaviour
         for (int i = 0; i < EnemyCount; i++)
         {
             Vector2 pos = Random.insideUnitCircle.normalized * SpawnRadius;
-            GameObject go = Instantiate(template, pos, Quaternion.identity);
+            // Fix: Spawn on X-Z plane
+            GameObject go = Instantiate(template, new Vector3(pos.x, 0, pos.y), Quaternion.identity);
             go.name = $"Enemy_{i}";
             go.GetComponent<Renderer>().material.color = Color.red;
 
@@ -253,8 +256,8 @@ public class SurvivorDemo : MonoBehaviour
 
     private void UpdatePlayer(float dt)
     {
-        Vector2 input = new Vector2(Input.GetAxis("Horizontal"), Input.GetAxis("Vertical"));
-        Vector2 velocity = input.normalized * PlayerSpeed;
+        Vector3 input = new Vector3(Input.GetAxis("Horizontal"), 0, Input.GetAxis("Vertical"));
+        Vector3 velocity = input.normalized * PlayerSpeed;
 
         // Set RVO pref velocity for player
         RVOSimulator.Instance.SetAgentPrefVelocity(0, velocity);
@@ -274,11 +277,11 @@ public class SurvivorDemo : MonoBehaviour
 
     private void ApplyPositions()
     {
-        _player.transform.position = (Vector3)RVOSimulator.Instance.GetAgentPosition(0);
+        _player.transform.position = RVOSimulator.Instance.GetAgentPosition(0);
 
         for (int i = 0; i < _enemies.Count; i++)
         {
-            _enemies[i].GameObject.transform.position = (Vector3)RVOSimulator.Instance.GetAgentPosition(_enemies[i].RVOAgentId);
+            _enemies[i].GameObject.transform.position = RVOSimulator.Instance.GetAgentPosition(_enemies[i].RVOAgentId);
         }
     }
 
@@ -296,12 +299,12 @@ public class SurvivorDemo : MonoBehaviour
                     if (_gridMap.IsObstacle(x, y))
                     {
                         Gizmos.color = new Color(1, 0, 0, 0.3f); // Red obstacle
-                        Gizmos.DrawCube(new Vector3(pos.x, pos.y, 0), Vector3.one * _gridMap.CellSize);
+                        Gizmos.DrawCube(new Vector3(pos.x, 0, pos.y), new Vector3(_gridMap.CellSize, 0.1f, _gridMap.CellSize));
                     }
                     else
                     {
                         Gizmos.color = new Color(0.5f, 0.5f, 0.5f, 0.1f); // Walkable
-                        Gizmos.DrawWireCube(new Vector3(pos.x, pos.y, 0), Vector3.one * _gridMap.CellSize);
+                        Gizmos.DrawWireCube(new Vector3(pos.x, 0, pos.y), new Vector3(_gridMap.CellSize, 0.1f, _gridMap.CellSize));
                     }
                 }
             }
@@ -312,13 +315,13 @@ public class SurvivorDemo : MonoBehaviour
             Gizmos.color = Color.blue;
             foreach (var obs in _obstacles)
             {
-                Vector3 p1 = new Vector3(obs.Point1.x, obs.Point1.y, 0);
-                Vector3 p2 = new Vector3(obs.Point2.x, obs.Point2.y, 0);
+                Vector3 p1 = new Vector3(obs.Point1.x, 0, obs.Point1.y);
+                Vector3 p2 = new Vector3(obs.Point2.x, 0, obs.Point2.y);
                 Gizmos.DrawLine(p1, p2);
 
                 // Draw Normal to show orientation
                 Vector3 mid = (p1 + p2) * 0.5f;
-                Vector3 normal = new Vector3(obs.Normal.x, obs.Normal.y, 0);
+                Vector3 normal = new Vector3(obs.Normal.x, 0, obs.Normal.y);
                 Gizmos.DrawLine(mid, mid + normal * 0.3f);
             }
         }
@@ -334,7 +337,7 @@ public class SurvivorDemo : MonoBehaviour
                 {
                     for (int j = 0; j < unit.Path.Count - 1; j++)
                     {
-                        Gizmos.DrawLine(new Vector3(unit.Path[j].x, unit.Path[j + 1].y, 0), new Vector3(unit.Path[j + 1].x, unit.Path[j + 1].y, 0));
+                        Gizmos.DrawLine(new Vector3(unit.Path[j].x, 0, unit.Path[j].y), new Vector3(unit.Path[j + 1].x, 0, unit.Path[j + 1].y));
                     }
                 }
             }
@@ -342,8 +345,7 @@ public class SurvivorDemo : MonoBehaviour
 
         if (ShowDebugGizmos && DebugAgentIndex < RVOSimulator.Instance.GetAgentCount())
         {
-            Vector2 debugPos = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
-            Vector3 debugPos3D = new Vector3(debugPos.x, debugPos.y, 0);
+            Vector3 debugPos3D = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
 
             // Draw debug agent in green with larger sphere
             Gizmos.color = Color.green;
@@ -359,8 +361,7 @@ public class SurvivorDemo : MonoBehaviour
             {
                 if (idx != DebugAgentIndex && idx < RVOSimulator.Instance.GetAgentCount())
                 {
-                    Vector2 neighborPos = RVOSimulator.Instance.GetAgentPosition(idx);
-                    Vector3 neighborPos3D = new Vector3(neighborPos.x, neighborPos.y, 0);
+                    Vector3 neighborPos3D = RVOSimulator.Instance.GetAgentPosition(idx);
                     Gizmos.DrawLine(debugPos3D, neighborPos3D);
                     Gizmos.DrawWireSphere(neighborPos3D, RVOSimulator.Instance.Radius);
                 }
@@ -374,14 +375,14 @@ public class SurvivorDemo : MonoBehaviour
                 Gizmos.color = Color.magenta;
                 for (int j = 0; j < unit.Path.Count - 1; j++)
                 {
-                    Vector3 p1 = new Vector3(unit.Path[j].x, unit.Path[j].y, 0);
-                    Vector3 p2 = new Vector3(unit.Path[j + 1].x, unit.Path[j + 1].y, 0);
+                    Vector3 p1 = new Vector3(unit.Path[j].x, 0, unit.Path[j].y);
+                    Vector3 p2 = new Vector3(unit.Path[j + 1].x, 0, unit.Path[j + 1].y);
                     Gizmos.DrawLine(p1, p2);
                 }
                 // Draw line to current target
                 if (unit.PathIndex < unit.Path.Count)
                 {
-                    Gizmos.DrawLine(debugPos3D, new Vector3(unit.Path[unit.PathIndex].x, unit.Path[unit.PathIndex].y, 0));
+                    Gizmos.DrawLine(debugPos3D, new Vector3(unit.Path[unit.PathIndex].x, 0, unit.Path[unit.PathIndex].y));
                 }
             }
 
@@ -389,8 +390,8 @@ public class SurvivorDemo : MonoBehaviour
             Gizmos.color = new Color(0, 1, 0, 0.3f);
             for (int i = 0; i < Mathf.Min(RVOSimulator.Instance.GetAgentCount(), 50); i++)
             {
-                Vector2 pos = RVOSimulator.Instance.GetAgentPosition(i);
-                Gizmos.DrawWireSphere(new Vector3(pos.x, pos.y, 0), RVOSimulator.Instance.Radius);
+                Vector3 pos = RVOSimulator.Instance.GetAgentPosition(i);
+                Gizmos.DrawWireSphere(pos, RVOSimulator.Instance.Radius);
             }
         }
     }
@@ -430,8 +431,8 @@ public class SurvivorDemo : MonoBehaviour
             GUILayout.Space(10);
             GUILayout.Label($"=== Debug Agent {DebugAgentIndex} ===");
             GUILayout.Label($"Neighbors Found: {_debugNeighbors.Count}");
-            Vector2 debugPos = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
-            GUILayout.Label($"Position: ({debugPos.x:F1}, {debugPos.y:F1})");
+            Vector3 debugPos = RVOSimulator.Instance.GetAgentPosition(DebugAgentIndex);
+            GUILayout.Label($"Position: ({debugPos.x:F1}, {debugPos.z:F1})");
         }
 
         GUILayout.EndArea();

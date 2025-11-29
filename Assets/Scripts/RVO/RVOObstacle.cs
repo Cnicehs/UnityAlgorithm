@@ -12,11 +12,18 @@ public class RVOObstacle
     public RVOObstacle NextObstacle;
     public RVOObstacle PrevObstacle;
 
+    public RVOObstacle() { }
+
     public RVOObstacle(float2 p1, float2 p2)
     {
         Point1 = p1;
         Point2 = p2;
-        float2 diff = p2 - p1;
+        UpdateDirectionAndNormal();
+    }
+
+    public void UpdateDirectionAndNormal()
+    {
+        float2 diff = Point2 - Point1;
         float len = math.length(diff);
         if (len > 0.0001f)
         {
