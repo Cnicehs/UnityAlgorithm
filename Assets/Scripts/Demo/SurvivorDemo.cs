@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using Unity.Mathematics;
 using Random = UnityEngine.Random;
+using Unity.Collections.LowLevel.Unsafe;
 
 public class SurvivorDemo : MonoBehaviour
 {
@@ -29,11 +30,13 @@ public class SurvivorDemo : MonoBehaviour
 
     [Header("Debug")]
     public bool ShowDebugGizmos = true;
+    public bool UseSIMDPathfinding = true;
     public int DebugAgentIndex = 1; // Agent 0 is player, start from 1
 
     private GameObject _player;
     private List<EnemyUnit> _enemies = new List<EnemyUnit>();
     private GridMap _gridMap;
+    private Unity.Collections.NativeArray<bool> _nativeObstacles;
     private List<RVOObstacle> _obstacles = new List<RVOObstacle>();
     private List<int> _debugNeighbors = new List<int>();
 
@@ -135,6 +138,17 @@ public class SurvivorDemo : MonoBehaviour
         CreateWall(new Vector2(-5, 15), new Vector2(5, 15));
         CreateWall(new Vector2(-5, 15), new Vector2(-5, 20));
         CreateWall(new Vector2(5, 15), new Vector2(5, 20));
+
+        // Initialize Native Obstacles for SIMD
+        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
+        _nativeObstacles = new Unity.Collections.NativeArray<bool>(MapWidth * MapHeight, Unity.Collections.Allocator.Persistent);
+        for (int x = 0; x < MapWidth; x++)
+        {
+            for (int y = 0; y < MapHeight; y++)
+            {
+                _nativeObstacles[y * MapWidth + x] = _gridMap.IsObstacle(x, y);
+            }
+        }
     }
 
     private void CreateWall(Vector2 start, Vector2 end)
@@ -213,9 +227,44 @@ public class SurvivorDemo : MonoBehaviour
 
                 // Simple A* to player
                 // Optimization: Don't run A* if line of sight is clear?
-                // For demo, just run A*
+                // Simple A* to player
+                if (UseSIMDPathfinding)
+                {
+                    Vector2Int startGrid = _gridMap.WorldToGrid(myPos);
+                    Vector2Int endGrid = _gridMap.WorldToGrid(playerPos);
 
-                AStarPathfinder.FindPath(myPos, playerPos, _gridMap, unit.Path);
+                    // Allocate max possible path length (map size)
+                    Unity.Collections.NativeArray<Unity.Mathematics.float2> nativePath = new Unity.Collections.NativeArray<Unity.Mathematics.float2>(_gridMap.Width * _gridMap.Height, Unity.Collections.Allocator.Temp);
+                    int pathLength = 0;
+
+                    unsafe
+                    {
+                        SIMDAStarPathfinder.FindPath(
+                            new Unity.Mathematics.int2(startGrid.x, startGrid.y),
+                            new Unity.Mathematics.int2(endGrid.x, endGrid.y),
+                            _gridMap.Width,
+                            _gridMap.Height,
+                            _nativeObstacles,
+                            (float2*)nativePath.GetUnsafePtr(),
+                            ref pathLength,
+                            nativePath.Length,
+                            new Unity.Mathematics.float2(_gridMap.Origin.x, _gridMap.Origin.y),
+                            _gridMap.CellSize
+                        );
+                    }
+                    
+                    unit.Path.Clear();
+                    for (int k = 0; k < pathLength; k++)
+                    {
+                        unit.Path.Add(new Vector2(nativePath[k].x, nativePath[k].y));
+                    }
+                    nativePath.Dispose();
+                }
+                else
+                {
+                    AStarPathfinder.FindPath(myPos, playerPos, _gridMap, unit.Path);
+                }
+                
                 unit.PathIndex = 0;
             }
 
@@ -423,5 +472,10 @@ public class SurvivorDemo : MonoBehaviour
         }
 
         GUILayout.EndArea();
+    }
+
+    private void OnDestroy()
+    {
+        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
     }
 }

@@ -19,7 +19,6 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     // Permutation table for branchless compression
     // Maps a 4-bit mask to a shuffle index vector
     // 16 entries * 4 ints = 64 ints
-    private static readonly int* _permutationTable;
 
     // Removed static constructor to avoid Burst error BC1091
     // We will initialize the table lazily or in the constructor if needed,
