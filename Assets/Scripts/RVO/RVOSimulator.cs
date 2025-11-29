@@ -20,10 +20,16 @@ public class RVOSimulator
     public float PositionUpdateTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.PositionUpdate");
     public float TotalStepTimeMs => (float)PerformanceProfiler.GetLastMs("RVO.Step");
 
+    private const float ObstacleLinkEpsilon = 0.05f;
+    private const float PenetrationPadding = 0.001f;
+
     private List<RVOAgent> _agents = new List<RVOAgent>();
     private List<ORCALine> _orcaLines = new List<ORCALine>();
     private List<int> _neighborIndices = new List<int>();
     private List<RVOAgent> _neighbors = new List<RVOAgent>();
+    private List<Vector2> _cachedPositions = new List<Vector2>();
+    private bool _obstaclesDirty = false;
+    private bool _spatialIndexDirty = true;
 
     private RVOSimulator()
     {
@@ -39,11 +45,29 @@ public class RVOSimulator
         agent.TimeHorizon = TimeHorizon;
         agent.TimeHorizonObst = TimeHorizonObst;
         _agents.Add(agent);
+        _spatialIndexDirty = true;
+    }
+
+    public bool RemoveAgent(int agentIndex)
+    {
+        if (agentIndex < 0 || agentIndex >= _agents.Count)
+        {
+            return false;
+        }
+
+        _agents.RemoveAt(agentIndex);
+        for (int i = agentIndex; i < _agents.Count; i++)
+        {
+            _agents[i].ID = i;
+        }
+        _spatialIndexDirty = true;
+        return true;
     }
 
     public void ClearAgents()
     {
         _agents.Clear();
+        _spatialIndexDirty = true;
     }
 
     public void SetAgentPrefVelocity(int i, Vector3 prefVel)
@@ -89,27 +113,86 @@ public class RVOSimulator
     public void AddObstacle(Vector3 p1, Vector3 p2)
     {
         _obstacles.Add(new RVOObstacle(new float2(p1.x, p1.z), new float2(p2.x, p2.z)));
+        _obstaclesDirty = true;
     }
 
     public void ClearObstacles()
     {
         _obstacles.Clear();
+        _obstaclesDirty = true;
+    }
+
+    public bool RemoveObstacle(int obstacleIndex)
+    {
+        if (obstacleIndex < 0 || obstacleIndex >= _obstacles.Count)
+        {
+            return false;
+        }
+
+        _obstacles.RemoveAt(obstacleIndex);
+        _obstaclesDirty = true;
+        return true;
     }
 
     public void ProcessObstacles()
     {
-        // 1. Link obstacles
-        for (int i = 0; i < _obstacles.Count; ++i)
+        if (_obstacles.Count == 0)
         {
-            for (int j = 0; j < _obstacles.Count; ++j)
-            {
-                if (i == j) continue;
+            _obstaclesDirty = false;
+            return;
+        }
 
-                if (math.lengthsq(_obstacles[i].Point2 - _obstacles[j].Point1) < 0.01f)
+        for (int i = 0; i < _obstacles.Count; i++)
+        {
+            _obstacles[i].NextObstacle = null;
+            _obstacles[i].PrevObstacle = null;
+        }
+
+        Dictionary<Vector2Int, List<RVOObstacle>> startLookup = new Dictionary<Vector2Int, List<RVOObstacle>>(_obstacles.Count);
+        float linkThresholdSq = ObstacleLinkEpsilon * ObstacleLinkEpsilon;
+
+        for (int i = 0; i < _obstacles.Count; i++)
+        {
+            Vector2Int key = QuantizePoint(_obstacles[i].Point1);
+            if (!startLookup.TryGetValue(key, out List<RVOObstacle> list))
+            {
+                list = new List<RVOObstacle>();
+                startLookup[key] = list;
+            }
+            list.Add(_obstacles[i]);
+        }
+
+        for (int i = 0; i < _obstacles.Count; i++)
+        {
+            RVOObstacle obstacle = _obstacles[i];
+            Vector2Int endKey = QuantizePoint(obstacle.Point2);
+            if (!startLookup.TryGetValue(endKey, out List<RVOObstacle> candidates))
+            {
+                continue;
+            }
+
+            RVOObstacle best = null;
+            float bestDistSq = float.MaxValue;
+            for (int j = 0; j < candidates.Count; j++)
+            {
+                RVOObstacle candidate = candidates[j];
+                if (candidate == obstacle)
                 {
-                    _obstacles[i].NextObstacle = _obstacles[j];
-                    _obstacles[j].PrevObstacle = _obstacles[i];
+                    continue;
                 }
+
+                float distSq = math.lengthsq(obstacle.Point2 - candidate.Point1);
+                if (distSq <= linkThresholdSq && distSq < bestDistSq)
+                {
+                    best = candidate;
+                    bestDistSq = distSq;
+                }
+            }
+
+            if (best != null)
+            {
+                obstacle.NextObstacle = best;
+                best.PrevObstacle = obstacle;
             }
         }
 
@@ -126,59 +209,33 @@ public class RVOSimulator
             }
             else
             {
-                // If not linked, treat as convex (or handle appropriately)
                 obst.IsConvex = true;
             }
         }
+
+        _obstaclesDirty = false;
     }
 
     public void Step(float dt)
     {
         using (PerformanceProfiler.ProfilerScope.Begin("RVO.Step"))
         {
-            // 1. Neighbor Query Phase
-            using (PerformanceProfiler.ProfilerScope.Begin("RVO.NeighborQuery"))
+            // Process obstacles if they have been modified
+            if (_obstaclesDirty)
             {
-                for (int i = 0; i < _agents.Count; i++)
-                {
-                    RVOAgent agent = _agents[i];
-
-                    _neighborIndices.Clear();
-                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
-
-                    _neighbors.Clear();
-                    for (int j = 0; j < _neighborIndices.Count; j++)
-                    {
-                        int idx = _neighborIndices[j];
-                        if (idx != i && idx < _agents.Count)
-                        {
-                            _neighbors.Add(_agents[idx]);
-                        }
-                        if (_neighbors.Count >= agent.MaxNeighbors) break;
-                    }
-                }
+                ProcessObstacles();
             }
 
-            // 2. RVO Computation Phase
+            // 1. RVO Computation Phase
             using (PerformanceProfiler.ProfilerScope.Begin("RVO.Compute"))
             {
                 for (int i = 0; i < _agents.Count; i++)
                 {
                     RVOAgent agent = _agents[i];
 
-                    // Re-query neighbors (Redundant? The previous block didn't store them per agent)
-                    // Optimization: We should store neighbors or do it in one pass.
-                    // For now, let's just re-query or fix the logic.
-                    // The previous block was just profiling? No, it was populating _neighbors but not using it?
-                    // Ah, the previous block was iterating but overwriting _neighbors.
-                    // Let's do the query inside the compute loop to be correct.
-
                     _neighborIndices.Clear();
                     SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
 
-                    // Sort neighbors by distance to ensure we pick the closest ones
-                    // Optimization: Use a custom comparer or struct to avoid repeated distance calcs?
-                    // For now, just sort the indices based on distance.
                     _neighborIndices.Sort((a, b) =>
                     {
                         float distA = math.distancesq(agent.Position, _agents[a].Position);
@@ -243,16 +300,60 @@ public class RVOSimulator
                     _agents[i].Position += _agents[i].Velocity * dt;
                 }
 
-                // 4. Update Spatial Index
+                // 4. Deep Penetration Separation
+                SeparateOverlappingAgents();
+
+                // 5. Update Spatial Index
                 // We need to sync the spatial index with new positions for the next frame's queries.
-                // Optimization: Avoid creating a new list every frame if possible.
-                // But SpatialIndexManager.UpdatePositions takes List<Vector2>.
-                List<Vector2> allPositions = new List<Vector2>(_agents.Count);
+                if (_cachedPositions.Capacity < _agents.Count)
+                {
+                    _cachedPositions.Capacity = _agents.Count;
+                }
+                _cachedPositions.Clear();
                 for (int i = 0; i < _agents.Count; i++)
                 {
-                    allPositions.Add(_agents[i].Position);
+                    float2 pos = _agents[i].Position;
+                    _cachedPositions.Add(new Vector2(pos.x, pos.y));
                 }
-                SpatialIndexManager.Instance.UpdatePositions(allPositions);
+                SpatialIndexManager.Instance.UpdatePositions(_cachedPositions);
+            }
+        }
+    }
+
+    private Vector2Int QuantizePoint(float2 point)
+    {
+        float quantizationScale = 1.0f / ObstacleLinkEpsilon;
+        return new Vector2Int(
+            Mathf.RoundToInt(point.x * quantizationScale),
+            Mathf.RoundToInt(point.y * quantizationScale)
+        );
+    }
+
+    private void SeparateOverlappingAgents()
+    {
+        for (int i = 0; i < _agents.Count; i++)
+        {
+            RVOAgent agent1 = _agents[i];
+
+            for (int j = i + 1; j < _agents.Count; j++)
+            {
+                RVOAgent agent2 = _agents[j];
+
+                float2 diff = agent2.Position - agent1.Position;
+                float distSq = math.lengthsq(diff);
+                float minDist = agent1.Radius + agent2.Radius + PenetrationPadding;
+                float minDistSq = minDist * minDist;
+
+                if (distSq < minDistSq && distSq > 0.0001f)
+                {
+                    float dist = math.sqrt(distSq);
+                    float2 dir = diff / dist;
+                    float overlap = minDist - dist;
+                    float2 separation = dir * (overlap * 0.5f);
+
+                    agent1.Position -= separation;
+                    agent2.Position += separation;
+                }
             }
         }
     }
