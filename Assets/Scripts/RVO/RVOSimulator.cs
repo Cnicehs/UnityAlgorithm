@@ -200,13 +200,6 @@ public class RVOSimulator
                     // Add Agent Lines
                     RVOMath.ConstructORCALines(agent, _neighbors, dt, _orcaLines);
 
-                    // Debug logging for first agent
-                    if (i == 0 && Time.frameCount % 60 == 0)
-                    {
-                        Debug.Log($"[RVO Agent 0] Neighbors: {_neighbors.Count}, Obstacle ORCA Lines: {obstacleORCACount}, Total ORCA Lines: {_orcaLines.Count}, Obstacles in sim: {_obstacles.Count}");
-                        Debug.Log($"[RVO Agent 0] Position: {agent.Position}, PrefVel: {agent.PrefVelocity}");
-                    }
-
                     // Linear Programming
                     float2 newVel = agent.NewVelocity;
                     int lineFail = RVOMath.linearProgram2(_orcaLines, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
@@ -219,10 +212,6 @@ public class RVOSimulator
 
                     agent.NewVelocity = newVel;
 
-                    if (i == 0 && Time.frameCount % 60 == 0)
-                    {
-                        Debug.Log($"[RVO Agent 0] NewVel: {newVel}");
-                    }
                 }
             }
 
@@ -235,10 +224,7 @@ public class RVOSimulator
                     _agents[i].Position += _agents[i].Velocity * dt;
                 }
 
-                // 4. Deep Penetration Separation
-                SeparateOverlappingAgents();
-
-                // 5. Update Spatial Index
+                // 4. Update Spatial Index
                 // We need to sync the spatial index with new positions for the next frame's queries.
                 if (_cachedPositions.Capacity < _agents.Count)
                 {
@@ -255,32 +241,4 @@ public class RVOSimulator
         }
     }
 
-    private void SeparateOverlappingAgents()
-    {
-        for (int i = 0; i < _agents.Count; i++)
-        {
-            RVOAgent agent1 = _agents[i];
-
-            for (int j = i + 1; j < _agents.Count; j++)
-            {
-                RVOAgent agent2 = _agents[j];
-
-                float2 diff = agent2.Position - agent1.Position;
-                float distSq = math.lengthsq(diff);
-                float minDist = agent1.Radius + agent2.Radius + PenetrationPadding;
-                float minDistSq = minDist * minDist;
-
-                if (distSq < minDistSq && distSq > 0.0001f)
-                {
-                    float dist = math.sqrt(distSq);
-                    float2 dir = diff / dist;
-                    float overlap = minDist - dist;
-                    float2 separation = dir * (overlap * 0.5f);
-
-                    agent1.Position -= separation;
-                    agent2.Position += separation;
-                }
-            }
-        }
-    }
 }

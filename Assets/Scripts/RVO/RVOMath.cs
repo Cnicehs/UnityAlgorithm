@@ -127,44 +127,19 @@ public static class RVOMath
             result = optVelocity;
         }
 
-        bool debugLog = Time.frameCount % 120 == 0;
-        if (debugLog)
-        {
-            Debug.Log($"[LP2] Initial result: {result}, optVel: {optVelocity}, radius: {radius}, lines: {lines.Count}");
-        }
-
         for (int i = 0; i < lines.Count; ++i)
         {
             float detValue = det(lines[i].Direction, lines[i].Point - result);
 
-            if (debugLog && i < 3) // Log first 3 lines
-            {
-                Debug.Log($"[LP2] Line {i}: Direction={lines[i].Direction}, Point={lines[i].Point}, det={detValue}");
-            }
-
             if (detValue > 0.0f)
             {
-                if (debugLog)
-                {
-                    Debug.Log($"[LP2] Line {i} violated! Calling LP1");
-                }
-
                 float2 tempResult = result;
                 if (!linearProgram1(lines, i, radius, optVelocity, directionOpt, ref result))
                 {
                     result = tempResult;
-                    if (debugLog)
-                    {
-                        Debug.Log($"[LP2] LP1 failed, returning index {i}");
-                    }
                     return i;
                 }
             }
-        }
-
-        if (debugLog)
-        {
-            Debug.Log($"[LP2] Final result: {result}");
         }
 
         return lines.Count;
@@ -297,13 +272,9 @@ public static class RVOMath
     public static void ConstructObstacleORCALines(RVOAgent agent, List<RVOObstacle> obstacles, float timeStep, List<ORCALine> orcaLines)
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
-        int linesAdded = 0;
-        bool debugLog = Time.frameCount % 120 == 0;
-
-        if (debugLog)
-        {
-            Debug.Log($"[ObstORCA] Agent pos: {agent.Position}, vel: {agent.Velocity}, obstacles: {obstacles.Count}");
-        }
+        
+        // Range check logic from RVO2-Unity to filter distant obstacles
+        float rangeSq = (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius) * (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius);
 
         for (int i = 0; i < obstacles.Count; ++i)
         {
@@ -312,13 +283,16 @@ public static class RVOMath
 
             // Handle null NextObstacle (treat as endpoint)
             float2 p2 = (obst2 != null) ? obst2.Point1 : obst1.Point2;
+            
+            // Filter obstacles that are too far away
+            float distSqToLine = distSqPointLineSegment(obst1.Point1, p2, agent.Position);
+            if (distSqToLine > rangeSq)
+            {
+                continue;
+            }
+
             float2 relativePosition1 = obst1.Point1 - agent.Position;
             float2 relativePosition2 = p2 - agent.Position;
-
-            if (debugLog)
-            {
-                Debug.Log($"[ObstORCA {i}] P1: {obst1.Point1}, P2: {p2}, Dir: {obst1.Direction}, Normal: {obst1.Normal}");
-            }
 
             // Check if agent is behind the obstacle line. If so, ignore it.
             // Only if convex.
@@ -386,20 +360,10 @@ public static class RVOMath
             else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
             {
                 // Collision with line segment
-                if (debugLog)
-                {
-                    Debug.Log($"[ObstORCA {i}] COLLISION! s={s:F3}, distSqLine={distSqLine:F3}, radiusSq={radiusSq:F3}");
-                }
-
                 // RVO2-Unity reference: collision constraints use point=(0,0) and direction=-obstacle.Direction
                 line.Point = new float2(0.0f, 0.0f);
                 line.Direction = -obst1.Direction;
                 orcaLines.Add(line);
-
-                if (debugLog)
-                {
-                    Debug.Log($"[ObstORCA {i}] Added collision line: Dir={line.Direction}, Point={line.Point}");
-                }
                 continue;
             }
 
