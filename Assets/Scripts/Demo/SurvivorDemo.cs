@@ -214,10 +214,11 @@ public class SurvivorDemo : MonoBehaviour
         Vector2 pBR = new Vector2(pMax.x, pMin.y);
         Vector2 pBL = new Vector2(pMin.x, pMin.y);
 
-        _obstacles.Add(new RVOObstacle(pTL, pTR)); // Top
-        _obstacles.Add(new RVOObstacle(pTR, pBR)); // Right
-        _obstacles.Add(new RVOObstacle(pBR, pBL)); // Bottom
-        _obstacles.Add(new RVOObstacle(pBL, pTL)); // Left
+        // Counter-Clockwise to ensure normals point OUTWARD (Left of line)
+        _obstacles.Add(new RVOObstacle(pTR, pTL)); // Top (Right to Left -> Left is Up/Out)
+        _obstacles.Add(new RVOObstacle(pTL, pBL)); // Left (Top to Bottom -> Left is Left/Out)
+        _obstacles.Add(new RVOObstacle(pBL, pBR)); // Bottom (Left to Right -> Left is Down/Out)
+        _obstacles.Add(new RVOObstacle(pBR, pTR)); // Right (Bottom to Top -> Left is Right/Out)
     }
 
     private void SpawnPlayer()
