@@ -272,140 +272,279 @@ public static class RVOMath
     public static void ConstructObstacleORCALines(RVOAgent agent, List<RVOObstacle> obstacles, float timeStep, List<ORCALine> orcaLines)
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
-        
-        // Range check logic from RVO2-Unity to filter distant obstacles
-        float rangeSq = (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius) * (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius);
+
+        bool debug = agent.ID == 0;
+
+        if (debug)
+        {
+            Debug.Log($"[RVO] === Agent {agent.ID} at {agent.Position} ===");
+            Debug.Log($"[RVO] TimeHorizonObst={agent.TimeHorizonObst}, MaxSpeed={agent.MaxSpeed}, Radius={agent.Radius}");
+            Debug.Log($"[RVO] Processing {obstacles.Count} obstacles (no range filtering)");
+        }
 
         for (int i = 0; i < obstacles.Count; ++i)
         {
-            RVOObstacle obst1 = obstacles[i];
-            RVOObstacle obst2 = obst1.NextObstacle;
+            RVOObstacle obstacle1 = obstacles[i];
 
-            // Handle null NextObstacle (treat as endpoint)
-            float2 p2 = (obst2 != null) ? obst2.Point1 : obst1.Point2;
-            
-            // Filter obstacles that are too far away
-            float distSqToLine = distSqPointLineSegment(obst1.Point1, p2, agent.Position);
-            if (distSqToLine > rangeSq)
+            // In our implementation, obstacle1 represents an edge from Point1 to Point2
+            // This is different from RVO2-Unity where each Obstacle is a vertex
+            // obstacle1.Point1 is the first vertex, obstacle1.Point2 is the second vertex
+            float2 vertex1 = obstacle1.Point1;
+            float2 vertex2 = obstacle1.Point2;
+
+            // NOTE: RVO2-Unity uses rangeSq filtering only within its KdTree spatial structure
+            // for performance optimization. Since we iterate all obstacles directly,
+            // we skip the range check to ensure all obstacles are considered.
+            // The ORCA line generation will naturally handle which obstacles affect the agent.
+
+            float2 relativePosition1 = vertex1 - agent.Position;
+            float2 relativePosition2 = vertex2 - agent.Position;
+
+            if (debug)
             {
-                continue;
+                Debug.Log($"[RVO]   Edge{i}: {vertex1}→{vertex2}, RelPos1={relativePosition1}, RelPos2={relativePosition2}");
             }
 
-            float2 relativePosition1 = obst1.Point1 - agent.Position;
-            float2 relativePosition2 = p2 - agent.Position;
+            // Check if velocity obstacle is already covered by previous ORCA lines
+            // REMOVED: This check was incorrect and not present in RVO2-Unity reference.
+            // It was causing valid obstacles (like the front face) to be skipped if side faces were processed first.
+            // The Linear Programming step will handle redundant constraints naturally.
 
-            // Check if agent is behind the obstacle line. If so, ignore it.
-            // Only if convex.
-
-            bool alreadyCovered = false;
-
-            for (int j = 0; j < orcaLines.Count; ++j)
-            {
-                if (det(invTimeHorizonObst * relativePosition1 - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON &&
-                    det(invTimeHorizonObst * relativePosition2 - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON)
-                {
-                    alreadyCovered = true;
-                    break;
-                }
-            }
-
-            if (alreadyCovered)
-            {
-                continue;
-            }
-
+            // Not yet covered. Check for collisions.
             float distSq1 = absSq(relativePosition1);
             float distSq2 = absSq(relativePosition2);
-            float radius = agent.Radius;
-            float radiusSq = radius * radius;
+            float radiusSq = agent.Radius * agent.Radius;
 
-            float2 obstacleVector = p2 - obst1.Point1;
-            float s = math.dot(-relativePosition1, obstacleVector) / absSq(obstacleVector);
-            float distSqLine = distSqPointLineSegment(obst1.Point1, p2, agent.Position);
+            float2 obstacleVec = vertex2 - vertex1;
+
+            // Back-face culling: If the agent is to the left of the edge (inside the half-plane defined by the edge),
+            // we skip it. RVO assumes CCW winding, so "Left" is "Inside".
+            // However, for a convex obstacle, if we are "Left" of a back-face, we are "behind" it relative to our position.
+            // We only care about "Front-facing" edges (where we are to the Right).
+            // det(obstacleVec, relativePosition1) > 0 means "Left" (if relativePosition1 is Vertex->Agent).
+            // But relativePosition1 is Vertex - Agent (Agent->Vertex).
+            // det(Vec, Agent->Vertex) < 0 means Agent is Right.
+            // det(Vec, Vertex->Agent) = -det(Vec, Agent->Vertex).
+            // So det(Vec, Vertex->Agent) > 0 means Agent is Right (Front-facing).
+            // det(Vec, Vertex->Agent) < 0 means Agent is Left (Back-facing).
+            if (det(obstacleVec, relativePosition1) < 0)
+            {
+                continue;
+            }
+
+            float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
+            float distSqLine = absSq(-relativePosition1 - s * obstacleVec);
+
 
             ORCALine line;
 
+            // Collision with left vertex
             if (s < 0.0f && distSq1 <= radiusSq)
             {
-                if (obst1.IsConvex)
+                if (obstacle1.IsConvex)
                 {
-                    float2 w = new float2(-relativePosition1.y, relativePosition1.x);
-                    line.Direction = normalize(w);
-                    line.Point = (radius - math.sqrt(distSq1)) * invTimeHorizonObst * line.Direction;
-                    line.Point += agent.Velocity;
+                    line.Point = new float2(0.0f, 0.0f);
+                    line.Direction = normalize(new float2(-relativePosition1.y, relativePosition1.x));
                     orcaLines.Add(line);
                 }
                 continue;
             }
+            // Collision with right vertex
             else if (s > 1.0f && distSq2 <= radiusSq)
             {
-                // If obst2 is null, we can't check its convexity or direction.
-                // But if it's null, it's an endpoint, so effectively convex.
-                // However, we don't have a "next" direction to check against.
-                // So we just treat it as a point collision if we are close to it.
+                // For the right vertex, we need to check the next obstacle's convexity
+                RVOObstacle nextObstacle = obstacle1.NextObstacle;
+                bool isConvex = (nextObstacle != null) ? nextObstacle.IsConvex : true;
+                float2 nextVertex = (nextObstacle != null) ? nextObstacle.Point2 : vertex2; // Fallback
 
-                bool nextIsConvex = (obst2 != null) ? obst2.IsConvex : true;
-                float2 nextDirection = (obst2 != null) ? obst2.Direction : obst1.Direction; // Fallback
-
-                if (nextIsConvex && det(relativePosition2, nextDirection) >= 0.0f)
+                if (isConvex && det(relativePosition2, nextVertex - vertex2) >= 0.0f)
                 {
-                    float2 n = normalize(relativePosition2);
-                    line.Direction = new float2(n.y, -n.x);
-                    line.Point = (radius - math.sqrt(distSq2)) * invTimeHorizonObst * n;
-                    line.Point += agent.Velocity;
+                    line.Point = new float2(0.0f, 0.0f);
+                    line.Direction = normalize(new float2(-relativePosition2.y, relativePosition2.x));
                     orcaLines.Add(line);
                 }
                 continue;
             }
+            // Collision with obstacle segment
             else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
             {
-                // Collision with line segment
-                // RVO2-Unity reference: collision constraints use point=(0,0) and direction=-obstacle.Direction
                 line.Point = new float2(0.0f, 0.0f);
-                line.Direction = -obst1.Direction;
+                line.Direction = -obstacle1.Direction;
                 orcaLines.Add(line);
                 continue;
             }
 
-            // No collision
-            if (s < 0.0f)
+            // No collision. Compute legs (velocity obstacle tangent lines)
+            float2 leftLegDirection, rightLegDirection;
+
+            // Track which obstacles define the left and right vertices where legs emanate from
+            // This is critical for foreign leg detection and cutoff center calculation
+            RVOObstacle leftVertexObstacle = obstacle1;          // Default: left leg from vertex1 (obstacle1.Point1)
+            RVOObstacle rightVertexObstacle = obstacle1.NextObstacle;  // Default: right leg from vertex2 (nextObstacle.Point1)
+
+            // Track which edge defines the cutoff line direction
+            RVOObstacle cutoffEdge = obstacle1;  // Default: original edge
+
+            if (s < 0.0f && distSqLine <= radiusSq)
             {
-                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition1;
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
+                // Obstacle viewed obliquely so that left vertex defines velocity obstacle
+                if (!obstacle1.IsConvex)
                 {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                    line.Point += agent.Velocity;
-                    orcaLines.Add(line);
+                    continue; // Ignore obstacle
                 }
+
+                // Both legs emanate from vertex1
+                rightVertexObstacle = obstacle1;  // Both legs now from vertex1
+
+                float leg1 = math.sqrt(distSq1 - radiusSq);
+                leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius,
+                                              relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
+                rightLegDirection = new float2(relativePosition1.x * leg1 + relativePosition1.y * agent.Radius,
+                                               -relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
             }
-            else if (s > 1.0f)
+            else if (s > 1.0f && distSqLine <= radiusSq)
             {
-                float2 w = agent.Velocity - invTimeHorizonObst * relativePosition2;
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
+                // Obstacle viewed obliquely so that right vertex defines velocity obstacle
+                RVOObstacle nextObstacle = obstacle1.NextObstacle;
+                bool isConvex = (nextObstacle != null) ? nextObstacle.IsConvex : true;
+
+                if (!isConvex)
                 {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                    line.Point += agent.Velocity;
-                    orcaLines.Add(line);
+                    continue; // Ignore obstacle
                 }
+
+                // Both legs emanate from vertex2
+                leftVertexObstacle = nextObstacle;  // Both legs now from vertex2
+                rightVertexObstacle = nextObstacle;
+                cutoffEdge = nextObstacle;  // Cutoff line is edge starting at vertex2
+
+                float leg2 = math.sqrt(distSq2 - radiusSq);
+                leftLegDirection = new float2(relativePosition2.x * leg2 - relativePosition2.y * agent.Radius,
+                                              relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
+                rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * agent.Radius,
+                                               -relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
             }
             else
             {
-                float2 w = agent.Velocity - invTimeHorizonObst * (relativePosition1 - s * obstacleVector);
-                float w_sq = absSq(w);
-                if (w_sq > radiusSq)
+                // Usual situation - compute legs from both vertices
+                if (obstacle1.IsConvex)
                 {
-                    float2 unit_w = math.normalize(w);
-                    line.Direction = new float2(unit_w.y, -unit_w.x);
-                    line.Point = (radius * invTimeHorizonObst - math.sqrt(w_sq)) * unit_w;
-                    line.Point += agent.Velocity;
-                    orcaLines.Add(line);
+                    float leg1 = math.sqrt(distSq1 - radiusSq);
+                    leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius,
+                                                  relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
                 }
+                else
+                {
+                    // Left vertex non-convex; left leg extends cut-off line
+                    leftLegDirection = -obstacle1.Direction;
+                }
+
+                RVOObstacle nextObstacle = obstacle1.NextObstacle;
+                if (nextObstacle != null && nextObstacle.IsConvex)
+                {
+                    float leg2 = math.sqrt(distSq2 - radiusSq);
+                    rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * agent.Radius,
+                                                   -relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
+                }
+                else
+                {
+                    // Right vertex non-convex; right leg extends cut-off line
+                    rightLegDirection = obstacle1.Direction;
+                }
+            }
+
+            // Foreign leg detection - use the CORRECT vertex obstacles
+            RVOObstacle leftNeighbor = leftVertexObstacle.PrevObstacle;
+
+            bool isLeftLegForeign = false;
+            bool isRightLegForeign = false;
+
+            if (leftVertexObstacle.IsConvex && leftNeighbor != null && det(leftLegDirection, -leftNeighbor.Direction) >= 0.0f)
+            {
+                // Left leg points into obstacle
+                leftLegDirection = -leftNeighbor.Direction;
+                isLeftLegForeign = true;
+            }
+
+            if (rightVertexObstacle != null && rightVertexObstacle.IsConvex && det(rightLegDirection, rightVertexObstacle.Direction) <= 0.0f)
+            {
+                // Right leg points into obstacle
+                rightLegDirection = rightVertexObstacle.Direction;
+                isRightLegForeign = true;
+            }
+
+
+            // Compute cut-off centers - MUST use the vertices where legs actually emanate from!
+            // In oblique cases, both legs may come from the same vertex
+            float2 leftCutOff = invTimeHorizonObst * (leftVertexObstacle.Point1 - agent.Position);
+            float2 rightCutOff = invTimeHorizonObst * (rightVertexObstacle.Point1 - agent.Position);
+            float2 cutOffVector = rightCutOff - leftCutOff;
+
+            // Project current velocity on velocity obstacle
+
+            // Check if current velocity is projected on cutoff circles
+            // Special case: when both legs from same vertex (oblique), t is always 0.5
+            float t = (leftVertexObstacle == rightVertexObstacle) ? 0.5f : math.dot(agent.Velocity - leftCutOff, cutOffVector) / absSq(cutOffVector);
+            float tLeft = math.dot(agent.Velocity - leftCutOff, leftLegDirection);
+            float tRight = math.dot(agent.Velocity - rightCutOff, rightLegDirection);
+
+            if ((t < 0.0f && tLeft < 0.0f) || (leftVertexObstacle == rightVertexObstacle && tLeft < 0.0f && tRight < 0.0f))
+            {
+                // Project on left cut-off circle
+                float2 unitW = normalize(agent.Velocity - leftCutOff);
+                line.Direction = new float2(unitW.y, -unitW.x);
+                line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * unitW;
+                orcaLines.Add(line);
+                continue;
+            }
+            else if (t > 1.0f && tRight < 0.0f)
+            {
+                // Project on right cut-off circle
+                float2 unitW = normalize(agent.Velocity - rightCutOff);
+                line.Direction = new float2(unitW.y, -unitW.x);
+                line.Point = rightCutOff + agent.Radius * invTimeHorizonObst * unitW;
+                orcaLines.Add(line);
+                continue;
+            }
+
+            // Project on left leg, right leg, or cut-off line (whichever is closest to velocity)
+            float distSqCutoff = (t < 0.0f || t > 1.0f || leftVertexObstacle == rightVertexObstacle) ? float.PositiveInfinity : absSq(agent.Velocity - (leftCutOff + t * cutOffVector));
+            float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (leftCutOff + tLeft * leftLegDirection));
+            float distSqRight = tRight < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (rightCutOff + tRight * rightLegDirection));
+
+            if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
+            {
+                // Project on cut-off line
+                line.Direction = -cutoffEdge.Direction;
+                line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                orcaLines.Add(line);
+                continue;
+            }
+            else if (distSqLeft <= distSqRight)
+            {
+                // Project on left leg
+                if (isLeftLegForeign)
+                {
+                    continue;
+                }
+
+                line.Direction = leftLegDirection;
+                line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                orcaLines.Add(line);
+                continue;
+            }
+            else
+            {
+                // Project on right leg
+                if (isRightLegForeign)
+                {
+                    continue;
+                }
+
+                line.Direction = rightLegDirection;
+                line.Point = rightCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                orcaLines.Add(line);
+                continue;
             }
         }
     }

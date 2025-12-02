@@ -75,9 +75,9 @@ public class RVOoBSDemo : MonoBehaviour
 
         for (int i = 0; i < AgentCount; i++)
         {
-            // Spawn at (Random X, -10)
-            Vector3 startPos = new Vector3(Random.Range(-5f, 5f), 0, -10f);
-            Vector3 targetPos = new Vector3(startPos.x, 0, 10f); // Move to +10 (through the wall)
+            // Spawn at top (Random X, +10) and move downward to -10 (through the wall)
+            Vector3 startPos = new Vector3(Random.Range(-5f, 5f), 0, 10f);
+            Vector3 targetPos = new Vector3(startPos.x, 0, -10f); // Move downward through the wall
 
             GameObject go = Instantiate(template, startPos, Quaternion.identity);
             go.name = $"Agent_{i}";

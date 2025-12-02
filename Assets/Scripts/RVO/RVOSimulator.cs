@@ -148,6 +148,64 @@ public class RVOSimulator
 
     public void ProcessObstacles()
     {
+        // Link obstacles together in a chain
+        // This is important for the leg-based velocity obstacle calculations
+        // Link obstacles together in a chain based on geometric connectivity
+        // This handles multiple disjoint polygons and out-of-order addition
+        float toleranceSq = 0.0001f;
+
+        Debug.Log("=== ProcessObstacles Start ===");
+        for (int i = 0; i < _obstacles.Count; i++)
+        {
+            RVOObstacle current = _obstacles[i];
+
+            Debug.Log($"Edge{i}: {current.Point1} → {current.Point2}, Dir: {current.Direction}");
+
+            // Find NextObstacle: starts where current ends
+            current.NextObstacle = null;
+            for (int j = 0; j < _obstacles.Count; j++)
+            {
+                if (i == j) continue;
+                if (math.distancesq(current.Point2, _obstacles[j].Point1) < toleranceSq)
+                {
+                    current.NextObstacle = _obstacles[j];
+                    Debug.Log($"  Next = Edge{j}");
+                    break;
+                }
+            }
+
+            // Find PrevObstacle: ends where current starts
+            current.PrevObstacle = null;
+            for (int j = 0; j < _obstacles.Count; j++)
+            {
+                if (i == j) continue;
+                if (math.distancesq(_obstacles[j].Point2, current.Point1) < toleranceSq)
+                {
+                    current.PrevObstacle = _obstacles[j];
+                    Debug.Log($"  Prev = Edge{j}");
+                    break;
+                }
+            }
+
+            // Update convexity based on angle with next obstacle
+            if (current.NextObstacle != null)
+            {
+                // An obstacle vertex is convex if turning left from current to next
+                // det > 0 means counter-clockwise turn (convex in CCW obstacle)
+                float2 nextDir = current.NextObstacle.Direction;
+                float detValue = RVOMath.det(current.Direction, nextDir);
+                current.IsConvex = detValue >= 0.0f;
+                Debug.Log($"  IsConvex = {current.IsConvex} (det={detValue})");
+            }
+            else
+            {
+                // If no next obstacle (e.g. open chain), assume convex
+                current.IsConvex = true;
+                Debug.Log($"  IsConvex = true (no next)");
+            }
+        }
+        Debug.Log("=== ProcessObstacles End ===");
+
         _obstaclesDirty = false;
     }
 
@@ -200,6 +258,11 @@ public class RVOSimulator
                     // Add Agent Lines
                     RVOMath.ConstructORCALines(agent, _neighbors, dt, _orcaLines);
 
+                    if (i == 0) // Debug Agent 0
+                    {
+                        Debug.Log($"[RVO] Agent 0: Obstacle ORCA={obstacleORCACount}, Agent ORCA={_orcaLines.Count - obstacleORCACount}, Total={_orcaLines.Count}");
+                    }
+
                     // Linear Programming
                     float2 newVel = agent.NewVelocity;
                     int lineFail = RVOMath.linearProgram2(_orcaLines, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
@@ -208,6 +271,11 @@ public class RVOSimulator
                     {
                         // Pass obstacleORCACount so collision constraints (point=(0,0)) are treated as HARD constraints
                         RVOMath.linearProgram3(_orcaLines, obstacleORCACount, lineFail, agent.MaxSpeed, ref newVel);
+                    }
+
+                    if (i == 0) // Debug Agent 0
+                    {
+                        Debug.Log($"[RVO] Agent 0: PrefVel={agent.PrefVelocity}, NewVel={newVel}, lineFail={lineFail}");
                     }
 
                     agent.NewVelocity = newVel;
