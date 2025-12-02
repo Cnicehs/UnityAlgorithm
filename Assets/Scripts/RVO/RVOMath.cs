@@ -273,13 +273,24 @@ public static class RVOMath
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
 
+        // Sort obstacles by distance to agent (RVO2-Unity logic)
+        // RVO2-Unity sorts neighbors during insertion into the list.
+        // We sort here to ensure the "Already Covered" check works correctly (implicit back-face culling).
+        float2 agentPos = agent.Position;
+        obstacles.Sort((a, b) =>
+        {
+            float distA = distSqPointLineSegment(a.Point1, a.Point2, agentPos);
+            float distB = distSqPointLineSegment(b.Point1, b.Point2, agentPos);
+            return distA.CompareTo(distB);
+        });
+
         bool debug = agent.ID == 0;
 
         if (debug)
         {
             Debug.Log($"[RVO] === Agent {agent.ID} at {agent.Position} ===");
             Debug.Log($"[RVO] TimeHorizonObst={agent.TimeHorizonObst}, MaxSpeed={agent.MaxSpeed}, Radius={agent.Radius}");
-            Debug.Log($"[RVO] Processing {obstacles.Count} obstacles (no range filtering)");
+            Debug.Log($"[RVO] Processing {obstacles.Count} obstacles (Sorted by distance)");
         }
 
         for (int i = 0; i < obstacles.Count; ++i)
@@ -306,9 +317,22 @@ public static class RVOMath
             }
 
             // Check if velocity obstacle is already covered by previous ORCA lines
-            // REMOVED: This check was incorrect and not present in RVO2-Unity reference.
-            // It was causing valid obstacles (like the front face) to be skipped if side faces were processed first.
-            // The Linear Programming step will handle redundant constraints naturally.
+            bool alreadyCovered = false;
+
+            for (int j = 0; j < orcaLines.Count; ++j)
+            {
+                if (det(invTimeHorizonObst * relativePosition1 - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON &&
+                    det(invTimeHorizonObst * relativePosition2 - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON)
+                {
+                    alreadyCovered = true;
+                    break;
+                }
+            }
+
+            if (alreadyCovered)
+            {
+                continue;
+            }
 
             // Not yet covered. Check for collisions.
             float distSq1 = absSq(relativePosition1);
@@ -317,20 +341,9 @@ public static class RVOMath
 
             float2 obstacleVec = vertex2 - vertex1;
 
-            // Back-face culling: If the agent is to the left of the edge (inside the half-plane defined by the edge),
-            // we skip it. RVO assumes CCW winding, so "Left" is "Inside".
-            // However, for a convex obstacle, if we are "Left" of a back-face, we are "behind" it relative to our position.
-            // We only care about "Front-facing" edges (where we are to the Right).
-            // det(obstacleVec, relativePosition1) > 0 means "Left" (if relativePosition1 is Vertex->Agent).
-            // But relativePosition1 is Vertex - Agent (Agent->Vertex).
-            // det(Vec, Agent->Vertex) < 0 means Agent is Right.
-            // det(Vec, Vertex->Agent) = -det(Vec, Agent->Vertex).
-            // So det(Vec, Vertex->Agent) > 0 means Agent is Right (Front-facing).
-            // det(Vec, Vertex->Agent) < 0 means Agent is Left (Back-facing).
-            if (det(obstacleVec, relativePosition1) < 0)
-            {
-                continue;
-            }
+            // REMOVED: Explicit Back-face culling.
+            // RVO2-Unity relies on Sorting + AlreadyCovered check to skip back faces.
+            // if (det(obstacleVec, relativePosition1) < 0) { continue; }
 
             float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
             float distSqLine = absSq(-relativePosition1 - s * obstacleVec);

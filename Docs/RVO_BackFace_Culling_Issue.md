@@ -17,33 +17,62 @@ The issue was caused by the agent processing **all** edges of the obstacle, incl
 4. **LP Failure**: This "inside" constraint, combined with the agent's position and velocity, resulted in a constraint line that was often outside the maximum speed circle (impossible to satisfy).
 5. **Consequence**: `linearProgram2` fails immediately when it encounters an impossible constraint. This failure caused the valid constraint from the "front-facing" top edge (which might have been processed later or overridden by the failure logic) to be ignored.
 
-## Solution: Back-Face Culling
-We implemented a **Back-Face Culling** check in `RVOMath.ConstructObstacleORCALines`.
+## Solutions and RVO2-Unity Mechanism
 
-### Logic
-An edge is considered "back-facing" if the agent is to the **Left** of the edge vector (assuming Counter-Clockwise winding where "Left" is "Inside" the obstacle).
+We explored two solutions to resolve this issue. The core problem is preventing the "back-facing" edges from generating invalid "inside" constraints.
 
-We use the determinant of the edge vector and the vector from the agent to the vertex to determine this:
-- `obstacleVec = vertex2 - vertex1`
-- `relativePosition1 = vertex1 - agent.Position` (Vector from Agent to Vertex)
-- `det(obstacleVec, relativePosition1)`
+### Solution 1: Explicit Back-Face Culling (Initial Approach)
 
-If `det < 0`, the agent is to the "Left" (Inside/Back) of the edge vector. These edges are skipped.
+Directly check if the edge is back-facing using the determinant, and skip it if so.
 
-### Code Implementation
+**Implementation:**
 ```csharp
-// In RVOMath.cs
-
 float2 obstacleVec = vertex2 - vertex1;
-
-// Back-face culling: If the agent is to the left of the edge (inside the half-plane defined by the edge),
-// we skip it. RVO assumes CCW winding, so "Left" is "Inside".
-// det(obstacleVec, relativePosition1) < 0 means Agent is Left (Back-facing).
-if (det(obstacleVec, relativePosition1) < 0)
-{
-    continue;
+// det < 0 means Agent is to the Left (Inside/Back) of the edge
+if (det(obstacleVec, relativePosition1) < 0) {
+    continue; // Skip back-facing edge
 }
 ```
 
-## Result
-With this fix, only "front-facing" edges generate constraints. The impossible constraints from back edges are discarded, allowing the Linear Programming solver to successfully find a valid velocity that respects the actual collision boundaries (the front-facing edges).
+**Pros:**
+- Simple and robust.
+- Works regardless of obstacle processing order (no sorting needed).
+- Efficient (avoids processing invalid edges entirely).
+
+**Cons:**
+- Differs from the reference RVO2-Unity implementation.
+
+### Solution 2: Sorting + Implicit Culling (RVO2-Unity Approach)
+
+This is the solution we finally adopted to align with the standard RVO2 library. RVO2-Unity does not use explicit culling; instead, it relies on processing order.
+
+**RVO2-Unity Mechanism:**
+1.  **Strict Distance Sorting**: RVO2-Unity sorts all obstacle neighbors by distance (closest to farthest) during the neighbor query phase.
+2.  **"Already Covered" Check**: It checks if a new obstacle's Velocity Obstacle (VO) is already covered by existing constraints.
+
+**Why it works:**
+- **Sorting** ensures the **Front-Facing Edge** (Closest) is processed *before* the **Back-Facing Edge** (Farthest).
+- The Front-Face generates a valid constraint first.
+- When the algorithm reaches the Back-Face, it is geometrically "behind" the Front-Face. Its VO is fully covered by the Front-Face's constraint.
+- The `alreadyCovered` check detects this redundancy and **skips** the Back-Face.
+
+**Our Implementation (Matching RVO2):**
+In `RVOMath.cs`, we implemented:
+1.  **Sorting**: We sort the `obstacles` list by distance (`distSqPointLineSegment`) before iteration.
+2.  **Restored `alreadyCovered`**: We restored the check that was previously removed.
+
+```csharp
+// 1. Sort by distance
+obstacles.Sort((a, b) => distSq(a).CompareTo(distSq(b)));
+
+// 2. Iterate and check coverage
+for (each obstacle) {
+   if (IsAlreadyCovered(obstacle)) continue;
+   // ... process ...
+}
+```
+
+### Conclusion on Sorting Issues
+This issue highlights a critical dependency on **Sorting** in the RVO algorithm.
+- **For Obstacles**: Sorting is required for the `alreadyCovered` optimization to work correctly as an implicit Back-Face Culler. Without sorting, we might process Back-Face first -> LP Failure.
+- **For Agents**: (Note for review) Sorting is also typically required for Neighbor Selection (picking the K closest neighbors). If neighbors are not sorted, we might pick distant agents and ignore close ones, leading to collisions. We must ensure all Neighbor Queries return sorted results or are sorted before use.
