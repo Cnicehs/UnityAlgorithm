@@ -112,6 +112,16 @@ public class SIMDRVOSimulator
                     _tempNeighbors.Clear();
                     SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
 
+                    // Sort neighbors by distance to ensure we pick the closest ones
+                    _tempNeighbors.Sort((a, b) =>
+                    {
+                        // Note: Using Vector2 for distance calculation as AgentData uses float2/Vector2
+                        // Accessing _agents[a] from NativeArray is fast enough here since we are in main thread
+                        float distA = math.distancesq(agent.Position, _agents[a].Position);
+                        float distB = math.distancesq(agent.Position, _agents[b].Position);
+                        return distA.CompareTo(distB);
+                    });
+
                     // Calculate offset for this agent's neighbor data
                     int offset = i * MaxNeighbors;
                     int count = 0;
