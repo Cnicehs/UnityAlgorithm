@@ -3,6 +3,16 @@ using Unity.Mathematics;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 
+/// <summary>
+/// SIMD RVO implementation using Burst.
+/// 
+/// DATA QUALITY REQUIREMENTS:
+/// 1. Neighbor Lists:
+///    - The 'neighborIndices' provided to ComputeRVOVelocities MUST contain the K-nearest neighbors for each agent.
+///    - While strict sorting is not required for correctness of a single linear program, ensuring neighbors are sorted
+///      by distance is STRONGLY RECOMMENDED to ensure that if MaxNeighbors is hit, the closest (most critical) ones are kept.
+///      (SIMDRVOSimulator now performs this sorting).
+/// </summary>
 [BurstCompile]
 public static unsafe class SIMDRVO
 {

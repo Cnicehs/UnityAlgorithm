@@ -59,6 +59,27 @@ public class RVOoBSDemo : MonoBehaviour
         RVOSimulator.Instance.AddObstacle(new Vector3(pBR.x, 0, pBR.y), new Vector3(pTR.x, 0, pTR.y)); // Right
         RVOSimulator.Instance.AddObstacle(new Vector3(pTR.x, 0, pTR.y), new Vector3(pTL.x, 0, pTL.y)); // Top
 
+        // 2.1 Create Concave "L-Shape" Obstacle at X=15
+        // Defines a solid L-shaped block.
+        // Bounding Box: [15, 25] x [0, 10]
+        // Empty Pocket (Concave area): [20, 25] x [5, 10] (Top-Right quadrant is empty)
+        // Vertices (CCW):
+        Vector3[] lShape = new Vector3[] {
+            new Vector3(15, 0, 0),  // Bottom-Left
+            new Vector3(25, 0, 0),  // Bottom-Right
+            new Vector3(25, 0, 5),  // Right-Mid
+            new Vector3(20, 0, 5),  // Inner Corner (Reflex Vertex)
+            new Vector3(20, 0, 10), // Top-Mid
+            new Vector3(15, 0, 10)  // Top-Left
+        };
+
+        for (int i = 0; i < lShape.Length; i++)
+        {
+            Vector3 p1 = lShape[i];
+            Vector3 p2 = lShape[(i + 1) % lShape.Length];
+            RVOSimulator.Instance.AddObstacle(p1, p2);
+        }
+
         RVOSimulator.Instance.ProcessObstacles();
 
         Debug.Log($"Obstacles added: {RVOSimulator.Instance.GetObstacles().Count}");
@@ -83,6 +104,27 @@ public class RVOoBSDemo : MonoBehaviour
             go.name = $"Agent_{i}";
             go.transform.localScale = new Vector3(AgentRadius * 2, 1, AgentRadius * 2);
             go.GetComponent<Renderer>().material.color = Color.green;
+
+            _agents.Add(go);
+            _targets.Add(targetPos);
+
+            RVOSimulator.Instance.AddAgent(startPos);
+        }
+
+        // Spawn extra agents for L-Shape test
+        for (int i = 0; i < 5; i++)
+        {
+            // Spawn inside the "Empty Pocket" of the L-Shape (Top-Right)
+            // X in [20, 25], Z in [5, 10]
+            Vector3 startPos = new Vector3(22f + Random.Range(-1f, 1f), 0, 8f); 
+            
+            // Target at Bottom-Left (10, 0), requires navigating around the Reflex Corner at (20, 5)
+            Vector3 targetPos = new Vector3(10f, 0, 0f); 
+
+            GameObject go = Instantiate(template, startPos, Quaternion.identity);
+            go.name = $"Agent_L_{i}";
+            go.transform.localScale = new Vector3(AgentRadius * 2, 1, AgentRadius * 2);
+            go.GetComponent<Renderer>().material.color = Color.blue;
 
             _agents.Add(go);
             _targets.Add(targetPos);

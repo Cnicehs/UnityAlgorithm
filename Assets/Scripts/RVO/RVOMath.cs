@@ -9,6 +9,19 @@ public struct ORCALine
     public float2 Point;
 }
 
+/// <summary>
+/// RVO Math utilities.
+/// 
+/// DATA QUALITY REQUIREMENTS:
+/// 1. Obstacle Processing:
+///    - Obstacles neighbors provided to ConstructObstacleORCALines MUST be sorted by distance to the agent.
+///    - This is critical for the "Already Covered" optimization to work correctly and implicitly cull back-facing edges.
+///    - (Note: Current implementation of ConstructObstacleORCALines performs this sorting internally on a local copy).
+///    
+/// 2. Agent Processing:
+///    - Agent neighbors provided to ConstructORCALines SHOULD be sorted by distance.
+///    - The list MUST represent the K-nearest neighbors. Passing random neighbors instead of closest ones will lead to collisions.
+/// </summary>
 public static class RVOMath
 {
     private const float RVO_EPSILON = 0.00001f;
