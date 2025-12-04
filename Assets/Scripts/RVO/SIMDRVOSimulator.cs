@@ -15,6 +15,7 @@ public class SIMDRVOSimulator
     public float NeighborDist = 10.0f;
     public int MaxNeighbors = 10;
     public float TimeHorizon = 2.0f;
+    public float TimeHorizonObst = 2.0f;
     public float Radius = 0.5f;
     public float MaxSpeed = 2.0f;
 
@@ -30,6 +31,11 @@ public class SIMDRVOSimulator
     private NativeArray<int> _neighborCounts;
     private NativeArray<int> _neighborOffsets;
 
+    private NativeArray<SIMDRVO.ObstacleData> _nativeObstacles;
+    private int _obstacleCount;
+
+    private List<Vector2> _positionCache = new List<Vector2>();
+
     private SIMDRVOSimulator()
     {
     }
@@ -41,6 +47,7 @@ public class SIMDRVOSimulator
         if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
+        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
 
         _agents = new NativeArray<SIMDRVO.AgentData>(count, Allocator.Persistent);
         _newVelocities = new NativeArray<float2>(count, Allocator.Persistent);
@@ -73,6 +80,7 @@ public class SIMDRVOSimulator
             agent.NeighborDist = NeighborDist;
             agent.MaxNeighbors = MaxNeighbors;
             agent.TimeHorizon = TimeHorizon;
+            agent.TimeHorizonObst = TimeHorizonObst;
             _agents[index] = agent;
         }
     }
@@ -83,6 +91,12 @@ public class SIMDRVOSimulator
         return Vector2.zero;
     }
 
+    public Vector2 GetAgentPosition(int index)
+    {
+        if (index >= 0 && index < _agentCount) return _agents[index].Position;
+        return Vector2.zero;
+    }
+
     public void Dispose()
     {
         if (_agents.IsCreated) _agents.Dispose();
@@ -90,11 +104,52 @@ public class SIMDRVOSimulator
         if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
+        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
     }
 
     public void Shutdown()
     {
         Dispose();
+    }
+
+    public void UpdateObstacles(List<RVOObstacle> obstacles)
+    {
+        if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
+        
+        _obstacleCount = obstacles.Count;
+        if (_obstacleCount == 0) return;
+
+        _nativeObstacles = new NativeArray<SIMDRVO.ObstacleData>(_obstacleCount, Allocator.Persistent);
+
+        // Map obstacles to linear array indices
+        // Assuming obstacles list index == native array index
+        for (int i = 0; i < _obstacleCount; i++)
+        {
+            var src = obstacles[i];
+            var dest = new SIMDRVO.ObstacleData
+            {
+                Point1 = src.Point1,
+                Point2 = src.Point2,
+                Direction = src.Direction,
+                IsConvex = src.IsConvex,
+                NextObstacleIdx = -1,
+                PrevObstacleIdx = -1
+            };
+
+            // Resolve indices
+            if (src.NextObstacle != null)
+            {
+                int nextIdx = obstacles.IndexOf(src.NextObstacle);
+                if (nextIdx != -1) dest.NextObstacleIdx = nextIdx;
+            }
+            if (src.PrevObstacle != null)
+            {
+                int prevIdx = obstacles.IndexOf(src.PrevObstacle);
+                if (prevIdx != -1) dest.PrevObstacleIdx = prevIdx;
+            }
+
+            _nativeObstacles[i] = dest;
+        }
     }
 
     private List<int> _tempNeighbors = new List<int>();
@@ -106,41 +161,60 @@ public class SIMDRVOSimulator
             // 1. Build Neighbor Lists (Main Thread)
             using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.NeighborQuery"))
             {
-                for (int i = 0; i < _agentCount; i++)
+                // Optimization: If using SIMDQuadTreeIndex, use its Batch Query (Burst)
+                // This avoids C# overhead of looping 500+ agents, allocating lists, and sorting in managed code.
+                var spatialIndex = SpatialIndexManager.Instance.GetCurrentIndex();
+                if (spatialIndex is SIMDQuadTreeIndex quadTree)
                 {
-                    var agent = _agents[i];
-                    _tempNeighbors.Clear();
-                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
+                    // Initialize offsets (Must be done BEFORE query as QueryNeighborsBatch reads them)
+                    // Using fixed stride: i * MaxNeighbors
+                    for(int i=0; i<_agentCount; i++) _neighborOffsets[i] = i * MaxNeighbors;
 
-                    // Sort neighbors by distance to ensure we pick the closest ones
-                    _tempNeighbors.Sort((a, b) =>
+                    quadTree.QueryNeighborsBatch(
+                        _agents, 
+                        _neighborIndices, 
+                        _neighborCounts, 
+                        _neighborOffsets, 
+                        MaxNeighbors
+                    );
+                }
+                else
+                {
+                    // Fallback to Managed implementation
+                    for (int i = 0; i < _agentCount; i++)
                     {
-                        // Note: Using Vector2 for distance calculation as AgentData uses float2/Vector2
-                        // Accessing _agents[a] from NativeArray is fast enough here since we are in main thread
-                        float distA = math.distancesq(agent.Position, _agents[a].Position);
-                        float distB = math.distancesq(agent.Position, _agents[b].Position);
-                        return distA.CompareTo(distB);
-                    });
+                        var agent = _agents[i];
+                        _tempNeighbors.Clear();
+                        SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
 
-                    // Calculate offset for this agent's neighbor data
-                    int offset = i * MaxNeighbors;
-                    int count = 0;
-                    
-                    // Bounds check: ensure we don't exceed array capacity
-                    int maxNeighborsForThisAgent = math.min(MaxNeighbors, _neighborIndices.Length - offset);
-                    
-                    for (int j = 0; j < _tempNeighbors.Count && count < maxNeighborsForThisAgent; j++)
-                    {
-                        int neighborIdx = _tempNeighbors[j];
-                        if (neighborIdx != i && neighborIdx < _agentCount)
+                        // Sort neighbors by distance to ensure we pick the closest ones
+                        _tempNeighbors.Sort((a, b) =>
                         {
-                            _neighborIndices[offset + count] = neighborIdx;
-                            count++;
+                            float distA = math.distancesq(agent.Position, _agents[a].Position);
+                            float distB = math.distancesq(agent.Position, _agents[b].Position);
+                            return distA.CompareTo(distB);
+                        });
+
+                        // Calculate offset for this agent's neighbor data
+                        int offset = i * MaxNeighbors;
+                        int count = 0;
+                        
+                        // Bounds check: ensure we don't exceed array capacity
+                        int maxNeighborsForThisAgent = math.min(MaxNeighbors, _neighborIndices.Length - offset);
+                        
+                        for (int j = 0; j < _tempNeighbors.Count && count < maxNeighborsForThisAgent; j++)
+                        {
+                            int neighborIdx = _tempNeighbors[j];
+                            if (neighborIdx != i && neighborIdx < _agentCount)
+                            {
+                                _neighborIndices[offset + count] = neighborIdx;
+                                count++;
+                            }
                         }
+                        
+                        _neighborCounts[i] = count;
+                        _neighborOffsets[i] = offset;
                     }
-                    
-                    _neighborCounts[i] = count;
-                    _neighborOffsets[i] = offset;
                 }
             }
 
@@ -152,10 +226,33 @@ public class SIMDRVOSimulator
                     (int*)_neighborIndices.GetUnsafePtr(),
                     (int*)_neighborCounts.GetUnsafePtr(),
                     (int*)_neighborOffsets.GetUnsafePtr(),
+                    (SIMDRVO.ObstacleData*)(_nativeObstacles.IsCreated ? _nativeObstacles.GetUnsafePtr() : null),
+                    _nativeObstacles.IsCreated ? _obstacleCount : 0,
                     (float2*)_newVelocities.GetUnsafePtr(),
                     _agentCount,
                     dt
                 );
+            }
+
+            // 3. Update Agents (Velocity & Position)
+            using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.Update"))
+            {
+                // Sync to managed list for SpatialIndexManager
+                if (_positionCache.Capacity < _agentCount) _positionCache.Capacity = _agentCount;
+                _positionCache.Clear();
+
+                for (int i = 0; i < _agentCount; i++)
+                {
+                    var agent = _agents[i];
+                    agent.Velocity = _newVelocities[i];
+                    agent.Position += agent.Velocity * dt;
+                    _agents[i] = agent; // Write back to NativeArray
+                    
+                    _positionCache.Add(new Vector2(agent.Position.x, agent.Position.y));
+                }
+                
+                // Update Spatial Index with new positions
+                SpatialIndexManager.Instance.UpdatePositions(_positionCache);
             }
         }
     }

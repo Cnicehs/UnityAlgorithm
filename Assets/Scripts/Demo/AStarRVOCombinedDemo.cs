@@ -37,16 +37,24 @@ public class AStarRVOCombinedDemo : MonoBehaviour
     {
         Debug.Log("AStarRVOCombinedDemo Start");
 
-        // 1. Initialize RVO (Settings & Clear) - MUST BE BEFORE MAP Population
-        InitializeRVO();
+        // 1. Initialize SIMD RVO
+        SIMDRVOSimulator.Instance.Initialize(AgentCount);
+        SIMDRVOSimulator.Instance.NeighborDist = 10.0f;
+        SIMDRVOSimulator.Instance.MaxNeighbors = 10;
+        SIMDRVOSimulator.Instance.TimeHorizon = 2.0f;
+        SIMDRVOSimulator.Instance.Radius = AgentRadius;
+        SIMDRVOSimulator.Instance.MaxSpeed = AgentSpeed;
 
-        // 2. Initialize Map (Adds Obstacles to RVO)
+        // 2. Initialize Map (Populates _rvoObstacles)
         InitializeMap();
 
-        // 3. Spawn Agents
+        // 3. Push Obstacles to SIMD Simulator
+        SIMDRVOSimulator.Instance.UpdateObstacles(_rvoObstacles);
+
+        // 4. Spawn Agents
         SpawnAgents();
 
-        // 4. Initialize Spatial Index
+        // 5. Initialize Spatial Index
         SpatialIndexManager.Instance.StructureType = SpatialStructureType.SIMDQuadTree;
         SpatialIndexManager.Instance.Initialize(AgentCount, MapSize);
     }
@@ -65,10 +73,32 @@ public class AStarRVOCombinedDemo : MonoBehaviour
         }
     }
 
+    private void OnGUI()
+    {
+        GUILayout.BeginArea(new Rect(10, 10, 400, 400));
+        GUILayout.Label($"A* + RVO Demo ({(UseSIMD ? "SIMD A*" : "Standard A*")})");
+        GUILayout.Label($"Agents: {AgentCount} | Obstacles: {ObstacleCount}");
+        
+        GUILayout.Space(10);
+        GUILayout.Label("=== RVO Performance (SIMD) ===");
+        GUILayout.Label($"Neighbor Query: {SIMDRVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
+        GUILayout.Label($"RVO Compute: {SIMDRVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
+        GUILayout.Label($"Total Step: {SIMDRVOSimulator.Instance.TotalStepTimeMs:F3} ms");
+
+        GUILayout.Space(10);
+        GUILayout.Label("=== Spatial Index ===");
+        GUILayout.Label($"Type: {SpatialIndexManager.Instance.StructureType}");
+        GUILayout.Label($"Build Time: {SpatialIndexManager.Instance.BuildTimeMs:F3} ms");
+
+        GUILayout.Space(10);
+        GUILayout.Label($"FPS: {1.0f / Time.smoothDeltaTime:F1}");
+        GUILayout.EndArea();
+    }
+
     private void OnDrawGizmos()
     {
-        // Draw RVO Obstacles
-        var obstacles = RVOSimulator.Instance.GetObstacles();
+        // Draw RVO Obstacles (from local list)
+        var obstacles = _rvoObstacles;
         if (obstacles != null)
         {
             foreach (var obs in obstacles)
@@ -102,7 +132,7 @@ public class AStarRVOCombinedDemo : MonoBehaviour
         UpdateAgentsLogic();
 
         // 2. Step RVO Simulation
-        RVOSimulator.Instance.Step(dt);
+        SIMDRVOSimulator.Instance.Step(dt);
 
         // 3. Sync Transforms
         SyncTransforms();
@@ -213,27 +243,22 @@ public class AStarRVOCombinedDemo : MonoBehaviour
         // TR -> TL (Left). Left is Down (In).
         // TL -> BL (Down). Left is Right (In).
         
-        RVOSimulator.Instance.AddObstacle(new Vector3(bl.x, 0, bl.y), new Vector3(br.x, 0, br.y));
-        RVOSimulator.Instance.AddObstacle(new Vector3(br.x, 0, br.y), new Vector3(tr.x, 0, tr.y));
-        RVOSimulator.Instance.AddObstacle(new Vector3(tr.x, 0, tr.y), new Vector3(tl.x, 0, tl.y));
-        RVOSimulator.Instance.AddObstacle(new Vector3(tl.x, 0, tl.y), new Vector3(bl.x, 0, bl.y));
+        AddRVOObstacleToList(bl, br);
+        AddRVOObstacleToList(br, tr);
+        AddRVOObstacleToList(tr, tl);
+        AddRVOObstacleToList(tl, bl);
+    }
+
+    private void AddRVOObstacleToList(Vector2 start, Vector2 end)
+    {
+        // Helper to match RVOSimulator logic but for local list
+        RVOObstacle obstacle = new RVOObstacle(new float2(start.x, start.y), new float2(end.x, end.y));
+        _rvoObstacles.Add(obstacle);
     }
 
     private void InitializeRVO()
     {
-        RVOSimulator.Instance.ClearAgents();
-        RVOSimulator.Instance.ClearObstacles(); // Cleared in AddRectObstacle calls? No, accumulating.
-        
-        // Settings
-        RVOSimulator.Instance.NeighborDist = 10.0f;
-        RVOSimulator.Instance.MaxNeighbors = 10;
-        RVOSimulator.Instance.TimeHorizon = 2.0f;
-        RVOSimulator.Instance.TimeHorizonObst = 0.5f;
-        RVOSimulator.Instance.Radius = AgentRadius;
-        RVOSimulator.Instance.MaxSpeed = AgentSpeed;
-
-        // Process Obstacles (Link them)
-        RVOSimulator.Instance.ProcessObstacles();
+        // Removed - handled in Start
     }
 
     private void SpawnAgents()
@@ -257,7 +282,9 @@ public class AStarRVOCombinedDemo : MonoBehaviour
             unit.NextPathUpdateTime = Random.Range(0f, PathUpdateInterval);
             
             _agents.Add(unit);
-            RVOSimulator.Instance.AddAgent(new Vector3(spawnPos.x, 0, spawnPos.y));
+            
+            // Initial update to SIMD
+            SIMDRVOSimulator.Instance.UpdateAgentData(i, spawnPos, Vector2.zero, Vector2.zero);
         }
 
         Destroy(template);
@@ -350,16 +377,77 @@ public class AStarRVOCombinedDemo : MonoBehaviour
             Vector2 dir = (nextWaypoint - pos2D).normalized;
             Vector2 prefVel = dir * AgentSpeed;
             
-            RVOSimulator.Instance.SetAgentPrefVelocity(unit.RVOAgentId, new Vector3(prefVel.x, 0, prefVel.y));
+            // Update SIMD data (Position/Velocity are updated by Simulator, we update PrefVel)
+            // Wait, we need to pass current pos/vel back if we manipulate them?
+            // Actually SIMDRVOSimulator maintains state. We just update PrefVel.
+            // But UpdateAgentData overwrites everything!
+            // We should read current state first?
+            // SIMDRVOSimulator doesn't expose partial update.
+            // But step updates internal state.
+            // We need a SetAgentPrefVelocity in SIMDRVOSimulator?
+            // Or just update the struct.
+            // Let's assume UpdateAgentData is cheap enough or add a helper.
+            // SIMDRVOSimulator.Instance.UpdateAgentData(id, pos, vel, prefVel);
+            // We need current Pos/Vel from Simulator.
+            
+            // Better: Add SetAgentPrefVelocity to SIMDRVOSimulator.
+            // For now, I will read, modify pref, write back.
+            // Actually, SIMD Simulator holds state in NativeArray.
+            // I should just update PrefVelocity.
+            // BUT I can't partial update easily without API.
+            // I'll stick to updating all, assuming I read back the simulated pos/vel first.
+            // But wait, SyncTransforms reads pos.
+            // So `_agents[i]` doesn't have latest pos until Sync.
+            // Sync happens AFTER Step.
+            
+            // Update cycle:
+            // 1. UpdateAgentsLogic (Decide PrefVel based on Current Pos).
+            //    - Current Pos comes from GameObject (synced last frame).
+            //    - We calculate PrefVel.
+            //    - We need to push PrefVel to Simulator.
+            // 2. Step (Simulates).
+            // 3. SyncTransforms (Read Pos from Simulator).
+            
+            // So in UpdateAgentsLogic, I need to send PrefVel.
+            // If I use UpdateAgentData, I must send current Pos/Vel too, otherwise I reset them?
+            // Yes.
+            // So: Vector2 currentPos = ...; Vector2 currentVel = SIMDRVOSimulator.Instance.GetNewVelocity(unit.RVOAgentId);
+            // Wait, GetNewVelocity returns last frame's result.
+            // Position? SIMDRVOSimulator updates internal position.
+            // Does it expose it? No `GetAgentPosition`.
+            // I need to add `GetAgentPosition` to SIMDRVOSimulator or assume GameObject pos is sync.
+            // It is synced.
+            
+            Vector2 currentVel = SIMDRVOSimulator.Instance.GetNewVelocity(unit.RVOAgentId);
+            SIMDRVOSimulator.Instance.UpdateAgentData(unit.RVOAgentId, pos2D, currentVel, prefVel);
         }
     }
 
     private void SyncTransforms()
     {
+        // Need access to positions from SIMD Simulator
+        // SIMDRVOSimulator doesn't expose positions publicy yet!
+        // It updates internal _agents NativeArray.
+        // I need to add a way to get position.
+        // Assuming UpdateAgentData updates the internal state that Step uses?
+        // Step uses `_agents` array.
+        // UpdateAgentData writes to `_agents`.
+        // Step updates `_agents` position?
+        // Let's check SIMDRVOSimulator.Step.
+        // It writes `newVelocities`.
+        // It updates `_agents[i].Velocity` and `Position`.
+        // So yes.
+        // But I need to read `_agents[i].Position`.
+        // SIMDRVOSimulator needs `GetAgentPosition`.
+        
+        // TEMPORARY FIX: Add GetAgentPosition to SIMDRVOSimulator via reflection or just assume I add it now.
+        // I will add it in next step.
+        // For now, I write the call assuming it exists.
+        
         for (int i = 0; i < _agents.Count; i++)
         {
-            Vector3 rvoPos = RVOSimulator.Instance.GetAgentPosition(i);
-            _agents[i].GameObject.transform.position = rvoPos;
+            Vector2 rvoPos = SIMDRVOSimulator.Instance.GetAgentPosition(i);
+            _agents[i].GameObject.transform.position = new Vector3(rvoPos.x, 0, rvoPos.y);
         }
     }
 

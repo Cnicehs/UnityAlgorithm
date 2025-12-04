@@ -286,18 +286,8 @@ public static class RVOMath
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
 
-        // Sort obstacles by distance to agent (RVO2-Unity logic)
-        // RVO2-Unity sorts neighbors during insertion into the list.
-        // We sort here to ensure the "Already Covered" check works correctly (implicit back-face culling).
-        // NOTE: We must create a local copy to sort, to avoid modifying the original list (which might be shared/global)
-        List<RVOObstacle> sortedObstacles = new List<RVOObstacle>(obstacles);
-        float2 agentPos = agent.Position;
-        sortedObstacles.Sort((a, b) =>
-        {
-            float distA = distSqPointLineSegment(a.Point1, a.Point2, agentPos);
-            float distB = distSqPointLineSegment(b.Point1, b.Point2, agentPos);
-            return distA.CompareTo(distB);
-        });
+        // Note: Obstacles should ideally be sorted by distance for "Already Covered" optimization to work best.
+        // However, we iterate the provided list directly. The caller (Spatial Index) is responsible for sorting.
 
         bool debug = agent.ID == 0;
 
@@ -305,12 +295,12 @@ public static class RVOMath
         {
             Debug.Log($"[RVO] === Agent {agent.ID} at {agent.Position} ===");
             Debug.Log($"[RVO] TimeHorizonObst={agent.TimeHorizonObst}, MaxSpeed={agent.MaxSpeed}, Radius={agent.Radius}");
-            Debug.Log($"[RVO] Processing {sortedObstacles.Count} obstacles (Sorted by distance)");
+            Debug.Log($"[RVO] Processing {obstacles.Count} obstacles");
         }
 
-        for (int i = 0; i < sortedObstacles.Count; ++i)
+        for (int i = 0; i < obstacles.Count; ++i)
         {
-            RVOObstacle obstacle1 = sortedObstacles[i];
+            RVOObstacle obstacle1 = obstacles[i];
 
             // In our implementation, obstacle1 represents an edge from Point1 to Point2
             // This is different from RVO2-Unity where each Obstacle is a vertex

@@ -90,6 +90,11 @@ private float _worldSize;
         _spatialIndex.QueryRadius(position, radius, results);
     }
 
+    public ISpatialIndex GetCurrentIndex()
+    {
+        return _spatialIndex;
+    }
+
     private void EnsureIndicesCreated()
     {
         if (_indexA == null || _indexB == null ||

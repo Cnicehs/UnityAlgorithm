@@ -26,8 +26,11 @@ public class RVOSimulator
     private List<ORCALine> _orcaLines = new List<ORCALine>();
     private List<int> _neighborIndices = new List<int>();
     private List<RVOAgent> _neighbors = new List<RVOAgent>();
+    private List<RVOObstacle> _neighborObstacles = new List<RVOObstacle>(); // Sorted obstacles
     private List<Vector2> _cachedPositions = new List<Vector2>();
     private bool _obstaclesDirty = false;
+
+    private IObstacleSpatialIndex _obstacleIndex = new ObstacleKdTreeIndex();
 
     private RVOSimulator()
     {
@@ -206,6 +209,9 @@ public class RVOSimulator
         }
         Debug.Log("=== ProcessObstacles End ===");
 
+        // Rebuild Spatial Index
+        _obstacleIndex.Build(_obstacles);
+
         _obstaclesDirty = false;
     }
 
@@ -226,6 +232,7 @@ public class RVOSimulator
                 {
                     RVOAgent agent = _agents[i];
 
+                    // 1. Query Agent Neighbors (Sorted)
                     _neighborIndices.Clear();
                     SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
 
@@ -247,12 +254,16 @@ public class RVOSimulator
                         if (_neighbors.Count >= agent.MaxNeighbors) break;
                     }
 
+                    // 2. Query Obstacle Neighbors (Sorted)
+                    // This sorting is required for "Already Covered" optimization in RVOMath to work correctly.
+                    _obstacleIndex.QueryNearest(agent.Position, _neighborObstacles);
+
                     // Construct ORCA Lines
                     _orcaLines.Clear();
 
-                    // Add Obstacle Lines FIRST
+                    // Add Obstacle Lines FIRST (using sorted list)
                     int orcaCountBefore = _orcaLines.Count;
-                    RVOMath.ConstructObstacleORCALines(agent, _obstacles, dt, _orcaLines);
+                    RVOMath.ConstructObstacleORCALines(agent, _neighborObstacles, dt, _orcaLines);
                     int obstacleORCACount = _orcaLines.Count - orcaCountBefore;
 
                     // Add Agent Lines

@@ -205,6 +205,83 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 
 
 
+    public void QueryNeighborsBatch(NativeArray<SIMDRVO.AgentData> agents, NativeArray<int> outIndices, NativeArray<int> outCounts, NativeArray<int> outOffsets, int maxNeighbors)
+    {
+        // Pointers for Burst
+        Span<Vector2> posSpan = _positions.AsSpan();
+        fixed (Vector2* posPtr = posSpan)
+        {
+            QueryNeighborsBatchBurst(
+                (SIMDRVO.AgentData*)agents.GetUnsafePtr(), 
+                agents.Length, 
+                (int*)outIndices.GetUnsafePtr(), 
+                (int*)outCounts.GetUnsafePtr(), 
+                (int*)outOffsets.GetUnsafePtr(), 
+                maxNeighbors,
+                (Node*)_nodes.GetUnsafePtr(), 
+                (int*)_linkedUnits.GetUnsafePtr(), 
+                (int*)_unitIndices.GetUnsafePtr(), 
+                (float2*)posPtr, 
+                _rootIndex
+            );
+        }
+    }
+
+    [BurstCompile]
+    private static void QueryNeighborsBatchBurst(
+        SIMDRVO.AgentData* agents, int agentCount, 
+        int* outIndices, int* outCounts, int* outOffsets, int maxNeighbors,
+        Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex)
+    {
+        for (int i = 0; i < agentCount; i++)
+        {
+            float2 pos = agents[i].Position;
+            float radius = agents[i].NeighborDist; // Use neighbor dist as radius? Or just K nearest? 
+            // Standard RVO uses "MaxNeighbors within NeighborDist".
+            // So we query K nearest, but filter by Dist? Or Query Radius?
+            // QueryKNearestBurst doesn't take radius.
+            // QueryRadiusBurst takes radius but doesn't limit K (except by maxResults).
+            // We need BOTH.
+            // Let's use QueryKNearestBurst because it sorts and returns K.
+            // But we need to ensure they are within radius.
+            // QueryKNearestBurst optimization `worstDistSq` helps.
+            // But if K-th neighbor is > radius, we should probably discard?
+            // RVO standard: "neighbors within neighborDist".
+            // If < K neighbors within dist, return them.
+            // If > K neighbors within dist, return closest K.
+            // So QueryKNearestBurst is correct IF we discard results > radius.
+            // OR we modify QueryKNearestBurst to accept maxDist.
+            
+            // For now, let's use QueryKNearestBurst and rely on RVO logic to ignore far ones?
+            // No, RVO logic iterates `neighbors`. If we pass far neighbors, it processes them.
+            // Extra processing cost.
+            
+            // Let's use QueryKNearestBurst. It returns sorted K nearest.
+            int count = 0;
+            int* resultPtr = outIndices + (i * maxNeighbors); // Using fixed stride logic from SIMDRVOSimulator
+            // Wait, SIMDRVOSimulator uses `neighborOffsets`.
+            // But here we can write directly if we assume fixed stride or use offsets.
+            // If offsets are provided, use them.
+            int offset = outOffsets[i]; // Assuming offsets are pre-calculated
+            resultPtr = outIndices + offset; // Reset ptr
+            
+            // Temporary buffer for this agent's query
+            // We can't stackalloc variable size. MaxNeighbors is likely small (e.g. 20).
+            // Let's stackalloc 128 ints.
+            int* tempResults = stackalloc int[128];
+            int tempCount = 0;
+            
+            QueryKNearestBurst(pos, maxNeighbors, nodes, linkedUnits, unitIndices, positions, rootIndex, tempResults, &tempCount, 128);
+            
+            // Copy to output
+            for(int j=0; j<tempCount; j++)
+            {
+                resultPtr[j] = tempResults[j];
+            }
+            outCounts[i] = tempCount;
+        }
+    }
+
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
         results.Clear();
