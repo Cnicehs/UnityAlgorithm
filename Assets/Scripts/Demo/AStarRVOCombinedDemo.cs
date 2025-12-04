@@ -97,6 +97,23 @@ public class AStarRVOCombinedDemo : MonoBehaviour
 
     private void OnDrawGizmos()
     {
+        // Draw Grid Map (to verify baking)
+        if (_gridMap != null)
+        {
+            for (int x = 0; x < _gridMap.Width; x++)
+            {
+                for (int y = 0; y < _gridMap.Height; y++)
+                {
+                    if (_gridMap.IsObstacle(x, y))
+                    {
+                        Vector2 pos = _gridMap.GridToWorld(x, y);
+                        Gizmos.color = new Color(1, 0, 0, 0.3f); // Semi-transparent Red
+                        Gizmos.DrawCube(new Vector3(pos.x, 0, pos.y), new Vector3(_gridMap.CellSize, 0.1f, _gridMap.CellSize));
+                    }
+                }
+            }
+        }
+
         // Draw RVO Obstacles (from local list)
         var obstacles = _rvoObstacles;
         if (obstacles != null)
@@ -453,19 +470,42 @@ public class AStarRVOCombinedDemo : MonoBehaviour
 
     private Vector2 GetRandomWalkablePoint()
     {
-        int maxAttempts = 100;
+        int maxAttempts = 1000;
         for (int i = 0; i < maxAttempts; i++)
         {
             float x = Random.Range(_origin.x + 2, _origin.x + MapSize - 2);
             float y = Random.Range(_origin.y + 2, _origin.y + MapSize - 2);
-            Vector2Int grid = _gridMap.WorldToGrid(new Vector2(x, y));
+            Vector2 target = new Vector2(x, y);
             
-            if (!_gridMap.IsObstacle(grid.x, grid.y))
+            // Check clearance (Agent Radius)
+            // We check if the agent's bounding box overlaps any obstacle cell
+            Vector2 min = target - new Vector2(AgentRadius, AgentRadius);
+            Vector2 max = target + new Vector2(AgentRadius, AgentRadius);
+            
+            Vector2Int minGrid = _gridMap.WorldToGrid(min);
+            Vector2Int maxGrid = _gridMap.WorldToGrid(max);
+            
+            bool valid = true;
+            for (int gx = minGrid.x; gx <= maxGrid.x; gx++)
             {
-                return new Vector2(x, y);
+                for (int gy = minGrid.y; gy <= maxGrid.y; gy++)
+                {
+                    if (_gridMap.IsObstacle(gx, gy))
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) break;
+            }
+
+            if (valid)
+            {
+                return target;
             }
         }
-        return Vector2.zero; // Fallback
+        Debug.LogWarning("Failed to find walkable point after " + maxAttempts + " attempts!");
+        return _origin + new Vector2(MapSize/2, MapSize/2); // Fallback to center (might be invalid but better than 0,0 if origin is offset)
     }
 
     private void OnDestroy()
