@@ -119,10 +119,54 @@ public class SIMDRVOSimulator
         _obstacleCount = obstacles.Count;
         if (_obstacleCount == 0) return;
 
+        // 1. Process Obstacles (Link and Calculate Convexity)
+        // This logic is copied from RVOSimulator.ProcessObstacles to ensure SIMD version receives valid data.
+        // It modifies the input list objects directly.
+        float toleranceSq = 0.0001f;
+        for (int i = 0; i < _obstacleCount; i++)
+        {
+            RVOObstacle current = obstacles[i];
+
+            // Find NextObstacle
+            current.NextObstacle = null;
+            for (int j = 0; j < _obstacleCount; j++)
+            {
+                if (i == j) continue;
+                if (math.distancesq(current.Point2, obstacles[j].Point1) < toleranceSq)
+                {
+                    current.NextObstacle = obstacles[j];
+                    break;
+                }
+            }
+
+            // Find PrevObstacle
+            current.PrevObstacle = null;
+            for (int j = 0; j < _obstacleCount; j++)
+            {
+                if (i == j) continue;
+                if (math.distancesq(obstacles[j].Point2, current.Point1) < toleranceSq)
+                {
+                    current.PrevObstacle = obstacles[j];
+                    break;
+                }
+            }
+
+            // Calculate Convexity
+            if (current.NextObstacle != null)
+            {
+                float2 nextDir = current.NextObstacle.Direction;
+                float detValue = RVOMath.det(current.Direction, nextDir);
+                current.IsConvex = detValue >= 0.0f;
+            }
+            else
+            {
+                current.IsConvex = true;
+            }
+        }
+
+        // 2. Convert to NativeArray
         _nativeObstacles = new NativeArray<SIMDRVO.ObstacleData>(_obstacleCount, Allocator.Persistent);
 
-        // Map obstacles to linear array indices
-        // Assuming obstacles list index == native array index
         for (int i = 0; i < _obstacleCount; i++)
         {
             var src = obstacles[i];
