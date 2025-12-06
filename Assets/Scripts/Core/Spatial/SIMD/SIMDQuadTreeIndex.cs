@@ -236,44 +236,29 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         for (int i = 0; i < agentCount; i++)
         {
             float2 pos = agents[i].Position;
-            float radius = agents[i].NeighborDist; // Use neighbor dist as radius? Or just K nearest? 
-            // Standard RVO uses "MaxNeighbors within NeighborDist".
-            // So we query K nearest, but filter by Dist? Or Query Radius?
-            // QueryKNearestBurst doesn't take radius.
-            // QueryRadiusBurst takes radius but doesn't limit K (except by maxResults).
-            // We need BOTH.
-            // Let's use QueryKNearestBurst because it sorts and returns K.
-            // But we need to ensure they are within radius.
-            // QueryKNearestBurst optimization `worstDistSq` helps.
-            // But if K-th neighbor is > radius, we should probably discard?
-            // RVO standard: "neighbors within neighborDist".
-            // If < K neighbors within dist, return them.
-            // If > K neighbors within dist, return closest K.
-            // So QueryKNearestBurst is correct IF we discard results > radius.
-            // OR we modify QueryKNearestBurst to accept maxDist.
+            // Use large radius or neighborDist? QueryKNearestBurst doesn't filter radius yet.
+            // But if we want RVO behavior, we might need radius.
+            // However, RVO usually processes K nearest.
+            // Let's call QueryKNearestBurst with default infinite radius behavior.
+            // Or better, update QueryKNearestBurst to support radius.
             
-            // For now, let's use QueryKNearestBurst and rely on RVO logic to ignore far ones?
-            // No, RVO logic iterates `neighbors`. If we pass far neighbors, it processes them.
-            // Extra processing cost.
+            // For now, reuse QueryKNearestBurst (which now supports radiusSq).
+            // Pass float.MaxValue as radiusSq if we only care about K.
+            // But RVO has NeighborDist.
+            // agents[i].NeighborDist * agents[i].NeighborDist
             
-            // Let's use QueryKNearestBurst. It returns sorted K nearest.
-            int count = 0;
-            int* resultPtr = outIndices + (i * maxNeighbors); // Using fixed stride logic from SIMDRVOSimulator
-            // Wait, SIMDRVOSimulator uses `neighborOffsets`.
-            // But here we can write directly if we assume fixed stride or use offsets.
-            // If offsets are provided, use them.
-            int offset = outOffsets[i]; // Assuming offsets are pre-calculated
-            resultPtr = outIndices + offset; // Reset ptr
-            
-            // Temporary buffer for this agent's query
-            // We can't stackalloc variable size. MaxNeighbors is likely small (e.g. 20).
-            // Let's stackalloc 128 ints.
-            int* tempResults = stackalloc int[128];
+            int* resultPtr = outIndices + outOffsets[i];
             int tempCount = 0;
             
-            QueryKNearestBurst(pos, maxNeighbors, nodes, linkedUnits, unitIndices, positions, rootIndex, tempResults, &tempCount, 128);
+            // Stackalloc small buffer
+            int* tempResults = stackalloc int[128];
             
-            // Copy to output
+            // float radiusSq = agents[i].NeighborDist * agents[i].NeighborDist; // If we want to filter
+            // But QueryKNearestBurst below needs update to accept radiusSq.
+            
+            // Let's pass MaxValue for now to maintain previous behavior, or implement filtering.
+            QueryKNearestBurst(pos, maxNeighbors, float.MaxValue, nodes, linkedUnits, unitIndices, positions, rootIndex, tempResults, &tempCount, 128);
+            
             for(int j=0; j<tempCount; j++)
             {
                 resultPtr[j] = tempResults[j];
@@ -283,6 +268,11 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     }
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
+    {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
     {
         results.Clear();
         int maxCandidates = k * 10;
@@ -296,7 +286,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -314,7 +304,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         Candidate* candidates = (Candidate*)UnsafeUtility.Malloc(maxResults * sizeof(Candidate), 4, Allocator.Temp);
         int candidateCount = 0;
@@ -325,7 +315,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         stack[stackCount++] = rootIndex;
 
         // Optimization: Track worst distance to prune nodes early
-        float worstDistSq = float.MaxValue;
+        float worstDistSq = radiusSq; // Start with radius as cutoff
 
         while (stackCount > 0)
         {
@@ -333,7 +323,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 
             // Optimization: Check distance to node bounds before processing
             float distToNode = DistToRect(position, nodes[nodeIdx]);
-            if (candidateCount >= k && distToNode * distToNode >= worstDistSq) continue;
+            if (distToNode * distToNode > worstDistSq) continue; // Use strict greater for radius pruning
 
             if (nodes[nodeIdx].Child0 == -1)
             {
@@ -341,16 +331,18 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
                 while (curr != -1)
                 {
                     float dSq = math.distancesq(positions[curr], position);
-                    if (candidateCount < k || dSq < worstDistSq)
+                    if (dSq <= radiusSq) // Radius check
                     {
-                        AddCandidate(curr, dSq, k, candidates, &candidateCount);
-                        if (candidateCount >= k)
+                        if (candidateCount < k || dSq < worstDistSq)
                         {
-                            // Update worstDistSq
-                            // Optimization: Maintain max-heap or sorted list to get worst quickly.
-                            // For now, linear scan is okay for small k.
-                            worstDistSq = 0;
-                            for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                            AddCandidate(curr, dSq, k, candidates, &candidateCount);
+                            if (candidateCount >= k)
+                            {
+                                // Update worstDistSq based on K-th candidate
+                                // Find worst in current set (which is kept sorted by AddCandidate? No, AddCandidate inserts sorted.)
+                                // AddCandidate keeps sorted array. So worst is last.
+                                worstDistSq = candidates[candidateCount - 1].DistSq;
+                            }
                         }
                     }
                     curr = linkedUnits[curr];
@@ -358,28 +350,12 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
                 continue;
             }
 
-            // Optimization: Sort children by distance to visit closest first
-            // This helps tighten the worstDistSq bound faster.
-            
             int c0 = nodes[nodeIdx].Child0;
             int c1 = nodes[nodeIdx].Child1;
             int c2 = nodes[nodeIdx].Child2;
             int c3 = nodes[nodeIdx].Child3;
             
-            float d0 = DistToRect(position, nodes[c0]);
-            float d1 = DistToRect(position, nodes[c1]);
-            float d2 = DistToRect(position, nodes[c2]);
-            float d3 = DistToRect(position, nodes[c3]);
-            
-            // Simple sorting network or just push in reverse order of distance
-            // We want to pop smallest distance last? No, stack is LIFO.
-            // We want to process closest first. So push furthest first.
-            
-            // Let's just push all and let the loop handle it, but sorting is better.
-            // For 4 children, full sort is a bit heavy.
-            // Let's just push them.
-            
-            if (stackCount < 60) // Safety margin
+            if (stackCount < 60) 
             {
                 stack[stackCount++] = c0;
                 stack[stackCount++] = c1;
@@ -388,19 +364,11 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             }
         }
 
-        // Sort
-        for (int i = 1; i < candidateCount; ++i)
-        {
-            Candidate key = candidates[i];
-            int j = i - 1;
-            while (j >= 0 && candidates[j].DistSq > key.DistSq)
-            {
-                candidates[j + 1] = candidates[j];
-                j--;
-            }
-            candidates[j + 1] = key;
-        }
-
+        // Sort? AddCandidate keeps them sorted.
+        // But verifying sort is cheap here.
+        // Actually AddCandidate implementation:
+        // "insertPos... for loop shift..." -> Yes, it maintains sorted order.
+        
         int finalCount = math.min(k, candidateCount);
         for (int i = 0; i < finalCount; i++) results[i] = candidates[i].Index;
         *resultCount = finalCount;
@@ -411,6 +379,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     private static void AddCandidate(int index, float distSq, int k, Candidate* candidates, int* count)
     {
         int insertPos = 0;
+        // Linear scan
         while (insertPos < *count && candidates[insertPos].DistSq < distSq) insertPos++;
 
         if (insertPos < k)

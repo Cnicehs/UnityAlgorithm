@@ -185,12 +185,19 @@ public class BVHIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         _candidateCache.Clear();
         if (_candidateCache.Capacity < k + 1) _candidateCache.Capacity = k + 1;
 
         _searchStack.Clear();
         _searchStack.Push(new SearchJob { NodeIndex = _rootIndex, MinDistSq = 0 });
+        
+        float radiusSq = radius * radius;
 
         while (_searchStack.Count > 0)
         {
@@ -199,17 +206,25 @@ public class BVHIndex : ISpatialIndex
             if (nodeIdx == -1) continue;
 
             // Pruning
+            float cutoffSq = radiusSq;
             if (_candidateCache.Count == k)
             {
-                float worstDistSq = _candidateCache[_candidateCache.Count - 1].distSq;
-                if (job.MinDistSq >= worstDistSq) continue;
+                if (_candidateCache[_candidateCache.Count - 1].distSq < cutoffSq)
+                {
+                    cutoffSq = _candidateCache[_candidateCache.Count - 1].distSq;
+                }
             }
+            
+            if (job.MinDistSq > cutoffSq) continue;
 
             // Leaf check
             if (_nodes[nodeIdx].UnitIndex != -1)
             {
                 float dSq = (_positions[_nodes[nodeIdx].UnitIndex] - position).sqrMagnitude;
-                AddCandidate(_nodes[nodeIdx].UnitIndex, dSq, k, _candidateCache);
+                if (dSq <= radiusSq)
+                {
+                    AddCandidate(_nodes[nodeIdx].UnitIndex, dSq, k, _candidateCache);
+                }
                 continue;
             }
 

@@ -234,14 +234,8 @@ public class RVOSimulator
 
                     // 1. Query Agent Neighbors (Sorted)
                     _neighborIndices.Clear();
-                    SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _neighborIndices);
-
-                    _neighborIndices.Sort((a, b) =>
-                    {
-                        float distA = math.distancesq(agent.Position, _agents[a].Position);
-                        float distB = math.distancesq(agent.Position, _agents[b].Position);
-                        return distA.CompareTo(distB);
-                    });
+                    // Query MaxNeighbors + 1 to account for self-inclusion
+                    SpatialIndexManager.Instance.QueryKNearestSorted(agent.Position, agent.MaxNeighbors + 1, agent.NeighborDist, _neighborIndices);
 
                     _neighbors.Clear();
                     for (int j = 0; j < _neighborIndices.Count; j++)

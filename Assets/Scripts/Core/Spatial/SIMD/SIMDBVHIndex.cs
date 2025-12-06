@@ -26,8 +26,6 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
     private List<Vector2> _positions;
     private int _count;
 
-
-
     public SIMDBVHIndex(int capacity)
     {
         _nodes = new NativeArray<Node>(capacity * 2, Allocator.Persistent);
@@ -95,7 +93,6 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
             int start = job.Start;
             int length = job.Length;
 
-            // Calc AABB
             float minX = float.MaxValue, minY = float.MaxValue;
             float maxX = float.MinValue, maxY = float.MinValue;
 
@@ -123,7 +120,6 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
             nodes[nodeIdx].UnitIndex = -1;
 
-            // Split
             float sizeX = maxX - minX;
             float sizeY = maxY - minY;
             int axis = (sizeX > sizeY) ? 0 : 1;
@@ -184,6 +180,11 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         int maxCandidates = k * 10;
         if (maxCandidates < 128) maxCandidates = 128;
@@ -196,7 +197,7 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -220,7 +221,7 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         if (rootIndex == -1) return;
 
@@ -232,37 +233,37 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = new SearchJob { NodeIndex = rootIndex, MinDistSq = 0 };
 
-        // Optimization: Track worst distance to prune nodes early
-        float worstDistSq = float.MaxValue;
+        float worstDistSq = radiusSq;
 
         while (stackCount > 0)
         {
             SearchJob job = stack[--stackCount];
-            int nodeIdx = job.NodeIndex;
+            int nodeIndex = job.NodeIndex;
 
-            if (nodeIdx == -1) continue;
+            if (nodeIndex == -1) continue;
 
-            // Optimization: Pruning
             if (candidateCount >= k && job.MinDistSq >= worstDistSq) continue;
 
-            if (nodes[nodeIdx].UnitIndex != -1)
+            if (nodes[nodeIndex].UnitIndex != -1)
             {
-                float dSq = math.distancesq(positions[nodes[nodeIdx].UnitIndex], position);
-                if (candidateCount < k || dSq < worstDistSq)
+                float dSq = math.distancesq(positions[nodes[nodeIndex].UnitIndex], position);
+                if (dSq <= radiusSq)
                 {
-                    AddCandidate(nodes[nodeIdx].UnitIndex, dSq, k, candidates, &candidateCount);
-                    if (candidateCount >= k)
+                    if (candidateCount < k || dSq < worstDistSq)
                     {
-                        // Update worstDistSq
-                        worstDistSq = 0;
-                        for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                        AddCandidate(nodes[nodeIndex].UnitIndex, dSq, k, candidates, &candidateCount);
+                        if (candidateCount >= k)
+                        {
+                            worstDistSq = 0;
+                            for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                        }
                     }
                 }
                 continue;
             }
 
-            int left = nodes[nodeIdx].Left;
-            int right = nodes[nodeIdx].Right;
+            int left = nodes[nodeIndex].Left;
+            int right = nodes[nodeIndex].Right;
 
             float distLeft = DistToAABB(position, nodes, left);
             float distRight = DistToAABB(position, nodes, right);
@@ -279,7 +280,6 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
             }
         }
 
-        // Sort
         for (int i = 1; i < candidateCount; ++i)
         {
             Candidate key = candidates[i];
@@ -358,22 +358,22 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
         while (stackCount > 0)
         {
             SearchJob job = stack[--stackCount];
-            int nodeIdx = job.NodeIndex;
+            int nodeIndex = job.NodeIndex;
 
-            if (nodeIdx == -1) continue;
+            if (nodeIndex == -1) continue;
             if (job.MinDistSq > radiusSq) continue;
 
-            if (nodes[nodeIdx].UnitIndex != -1)
+            if (nodes[nodeIndex].UnitIndex != -1)
             {
-                if (math.distancesq(positions[nodes[nodeIdx].UnitIndex], position) <= radiusSq)
+                if (math.distancesq(positions[nodes[nodeIndex].UnitIndex], position) <= radiusSq)
                 {
-                    results[(*resultCount)++] = nodes[nodeIdx].UnitIndex;
+                    results[(*resultCount)++] = nodes[nodeIndex].UnitIndex;
                 }
                 continue;
             }
 
-            int left = nodes[nodeIdx].Left;
-            int right = nodes[nodeIdx].Right;
+            int left = nodes[nodeIndex].Left;
+            int right = nodes[nodeIndex].Right;
 
             float distLeft = DistToAABB(position, nodes, left);
             float distRight = DistToAABB(position, nodes, right);

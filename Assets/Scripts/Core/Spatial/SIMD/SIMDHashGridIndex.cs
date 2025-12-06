@@ -16,33 +16,9 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     private float _cellSize;
     private float2 _origin;
 
-    // Permutation table for branchless compression
-    // Maps a 4-bit mask to a shuffle index vector
-    // 16 entries * 4 ints = 64 ints
-
-    // Removed static constructor to avoid Burst error BC1091
-    // We will initialize the table lazily or in the constructor if needed,
-    // but for Burst compatibility, static readonly pointers initialized in static constructor are tricky.
-    // Instead, we can use a shared static struct or just initialize it once.
-    // However, since we can't use UnsafeUtility.Malloc in static ctor for Burst,
-    // let's use a simpler approach: hardcode the table or use a lookup function.
-    // Hardcoding 16x4 ints is verbose but safe.
-    
-    // Actually, we can just use a local stackalloc table in the function if it's small enough,
-    // or pass it as a parameter. But passing is annoying.
-    // Let's use a lookup function that returns the shuffle mask.
-    
     [BurstCompile]
     private static void GetShuffleMask(int mask, int* result)
     {
-        // 0: -1, -1, -1, -1
-        // 1: 0, -1, -1, -1
-        // 2: 1, -1, -1, -1
-        // 3: 0, 1, -1, -1
-        // ...
-        // This is basically a switch statement or a small lookup.
-        // Since we are in Burst, a switch is fine.
-        
         switch (mask)
         {
             case 0: *(int4*)result = new int4(-1, -1, -1, -1); break;
@@ -177,6 +153,11 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         int maxCandidates = k * 10;
         if (maxCandidates < 128) maxCandidates = 128;
@@ -188,7 +169,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         {
             fixed (float2* originPtr = &_origin)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates);
             }
 
             for (int i = 0; i < resultCount; i++)
@@ -215,7 +196,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults)
     {
         float2 origin = *originPtr;
         int startX = (int)((position.x - origin.x) / cellSize);
@@ -226,13 +207,20 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
         int searchRadius = 0;
         int maxSearchRadius = math.max(width, height);
+        
+        // Limit maxSearchRadius
+        if (radiusSq != float.MaxValue)
+        {
+            int limit = (int)(math.sqrt(radiusSq) / cellSize) + 1;
+            maxSearchRadius = math.min(maxSearchRadius, limit);
+        }
 
         Candidate* candidates = (Candidate*)UnsafeUtility.Malloc(maxResults * sizeof(Candidate), 4, Allocator.Temp);
         int candidateCount = 0;
 
         float4 target4 = new float4(position.x, position.y, position.x, position.y);
 
-        while (searchRadius < maxSearchRadius)
+        while (searchRadius <= maxSearchRadius) // <= to allow reaching limit
         {
             int rMinX = math.max(0, startX - searchRadius);
             int rMaxX = math.min(width - 1, startX + searchRadius);
@@ -266,18 +254,22 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
                             float2 dists0 = sq0.xz + sq0.yw;
                             float2 dists1 = sq1.xz + sq1.yw;
-
-                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i], DistSq = dists0.x };
-                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 1], DistSq = dists0.y };
-                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 2], DistSq = dists1.x };
-                            if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 3], DistSq = dists1.y };
+                            
+                            // Check radius
+                            if (dists0.x <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i], DistSq = dists0.x };
+                            if (dists0.y <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 1], DistSq = dists0.y };
+                            if (dists1.x <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 2], DistSq = dists1.x };
+                            if (dists1.y <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 3], DistSq = dists1.y };
                         }
                         else
                         {
                             for (int j = i; j < count; j++)
                             {
                                 float distSq = math.distancesq(sortedPositions[start + j], position);
-                                if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + j], DistSq = distSq };
+                                if (distSq <= radiusSq)
+                                {
+                                    if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + j], DistSq = distSq };
+                                }
                             }
                         }
                     }
@@ -415,14 +407,8 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
                         {
                             int4 indices = new int4(originalIndices[start + i], originalIndices[start + i + 1], originalIndices[start + i + 2], originalIndices[start + i + 3]);
                             
-                            // Load shuffle mask
                             int4 shuffleMask;
                             GetShuffleMask(maskInt, (int*)&shuffleMask);
-                            
-                            // Shuffle valid indices to front
-                            // math.shuffle for int4 takes ShuffleComponent which is compile time constant
-                            // We need dynamic shuffle.
-                            // We can use indexer or pointer math since we have the shuffle mask in a register.
                             
                             int* indicesPtr = (int*)&indices;
                             int* shufflePtr = (int*)&shuffleMask;
@@ -435,14 +421,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
                             compressedPtr[2] = indicesPtr[shufflePtr[2]];
                             compressedPtr[3] = indicesPtr[shufflePtr[3]];
                             
-                            // Write valid count
                             int validCount = math.countbits(maskInt);
-                            
-                            // Unsafe write to results buffer
-                            // We assume buffer has enough space (checked by maxResults logic usually, or we should check)
-                            // For max speed we skip check here if we trust maxResults
-                            
-                            // Write all 4 ints to memory (some might be garbage but we only increment count by validCount)
                             *(int4*)(results + *resultCount) = compressed;
                             *resultCount += validCount;
                         }

@@ -12,6 +12,7 @@ public interface ISpatialIndex
 
     /// <summary>
     /// Finds the K nearest neighbors to the query position.
+    /// Results are NOT guaranteed to be sorted.
     /// </summary>
     /// <param name="position">Query position.</param>
     /// <param name="k">Number of neighbors to find.</param>
@@ -19,7 +20,18 @@ public interface ISpatialIndex
     void QueryKNearest(Vector2 position, int k, List<int> results);
 
     /// <summary>
+    /// Finds the K nearest neighbors to the query position within a maximum radius.
+    /// Results are sorted by distance (nearest first).
+    /// </summary>
+    /// <param name="position">Query position.</param>
+    /// <param name="k">Number of neighbors to find.</param>
+    /// <param name="radius">Search radius.</param>
+    /// <param name="results">List to store the indices of the nearest neighbors.</param>
+    void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results);
+
+    /// <summary>
     /// Finds all neighbors within a given radius.
+    /// Results are NOT guaranteed to be sorted.
     /// </summary>
     /// <param name="position">Query position.</param>
     /// <param name="radius">Search radius.</param>

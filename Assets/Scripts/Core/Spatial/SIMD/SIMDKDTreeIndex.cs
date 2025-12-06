@@ -19,14 +19,12 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
         public float SplitValue;
     }
 
-    private NativeArray<Node> _nodes; // Using NativeArray for easier management, can get pointer
-    private NativeArray<int> _indicesBuffer; // Reusable buffer
+    private NativeArray<Node> _nodes; 
+    private NativeArray<int> _indicesBuffer; 
     private int _rootIndex;
     
     private List<Vector2> _positions;
     private int _count;
-
-
 
     public SIMDKDTreeIndex(int capacity)
     {
@@ -76,22 +74,11 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
     {
         for (int i = 0; i < count; i++) indices[i] = i;
 
-        // Iterative Build
-        // We need a stack.
-        // Stack size? Log2(N) * 2 roughly. For 1M units, depth ~20. Stack 64 is plenty.
-        // But we need to allocate it.
-        
         BuildJob* stack = stackalloc BuildJob[64];
         int stackCount = 0;
 
-        // Root
         int rootIndex = -1;
         
-        // We can't return rootIndex directly from iterative if we don't know it yet.
-        // But we know the first processed node will be root? 
-        // No, median is root.
-        
-        // Let's do the first step manually to get root.
         int mid = count / 2;
         QuickSelect(indices, positions, 0, count, mid, 0);
         rootIndex = indices[mid];
@@ -102,7 +89,6 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
         nodes[rootIndex].Left = -1;
         nodes[rootIndex].Right = -1;
 
-        // Push children
         if (stackCount < 64) stack[stackCount++] = new BuildJob { Start = mid + 1, Length = count - mid - 1, Depth = 1, ParentIndex = rootIndex, IsLeft = false };
         if (stackCount < 64) stack[stackCount++] = new BuildJob { Start = 0, Length = mid, Depth = 1, ParentIndex = rootIndex, IsLeft = true };
 
@@ -163,7 +149,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
         int pivotValIdx = indices[pivotIndex];
         float pivotVal = (axis == 0) ? positions[pivotValIdx].x : positions[pivotValIdx].y;
 
-        int temp = indices[pivotIndex]; indices[pivotIndex] = indices[right]; indices[right] = temp; // Swap pivot to end
+        int temp = indices[pivotIndex]; indices[pivotIndex] = indices[right]; indices[right] = temp;
 
         int storeIndex = left;
         for (int i = left; i < right; i++)
@@ -183,6 +169,11 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         int maxCandidates = k * 10;
         if (maxCandidates < 128) maxCandidates = 128;
@@ -195,7 +186,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
             }
 
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
@@ -220,7 +211,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
         if (rootIndex == -1) return;
 
@@ -232,8 +223,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = new SearchJob { NodeIndex = rootIndex, MinDistSq = 0 };
 
-        // Optimization: Track worst distance to prune nodes early
-        float worstDistSq = float.MaxValue;
+        float worstDistSq = radiusSq;
 
         while (stackCount > 0)
         {
@@ -242,20 +232,21 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
             if (nodeIndex == -1) continue;
 
-            // Optimization: Pruning
-            if (candidateCount >= k && job.MinDistSq >= worstDistSq) continue;
+            if (job.MinDistSq > worstDistSq) continue; // Pruning
 
             int unitIdx = nodes[nodeIndex].UnitIndex;
             float distSq = math.distancesq(positions[unitIdx], position);
 
-            if (candidateCount < k || distSq < worstDistSq)
+            if (distSq <= radiusSq) // Radius check
             {
-                AddCandidate(unitIdx, distSq, k, candidates, &candidateCount);
-                if (candidateCount >= k)
+                if (candidateCount < k || distSq < worstDistSq)
                 {
-                    // Update worstDistSq
-                    worstDistSq = 0;
-                    for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                    AddCandidate(unitIdx, distSq, k, candidates, &candidateCount);
+                    if (candidateCount >= k)
+                    {
+                        worstDistSq = 0;
+                        for (int i = 0; i < candidateCount; ++i) if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                    }
                 }
             }
 
@@ -277,8 +268,7 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
             }
         }
 
-        // Sort and copy
-        // Simple sort
+        // Sort results
         for (int i = 1; i < candidateCount; ++i)
         {
             Candidate key = candidates[i];
@@ -300,13 +290,11 @@ public unsafe class SIMDKDTreeIndex : ISpatialIndex, IDisposable
 
     private static void AddCandidate(int index, float distSq, int k, Candidate* candidates, int* count)
     {
-        // Insert sorted
         int insertPos = 0;
         while (insertPos < *count && candidates[insertPos].DistSq < distSq) insertPos++;
 
         if (insertPos < k)
         {
-            // Shift
             int end = math.min(*count, k - 1);
             for (int i = end; i > insertPos; i--)
             {

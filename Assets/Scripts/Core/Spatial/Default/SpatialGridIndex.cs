@@ -33,9 +33,7 @@ public class SpatialGridIndex : ISpatialIndex
     public UniTask BuildAsync(List<Vector2> positions)
     {
         // Grid build is fast and hard to parallelize (write conflicts).
-        // We run it synchronously on the calling thread (which should be a background thread).
-        // Or we can wrap it in UniTask.Run if called from main thread, but Manager calls us on ThreadPool.
-        // So we just do the work.
+        // We run it synchronously on the calling thread.
         
         _positions = positions;
         int count = positions.Count;
@@ -77,9 +75,13 @@ public class SpatialGridIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         
-        // Reuse cache
         _candidateCache.Clear();
         if (_candidateCache.Capacity < k * 4)
         {
@@ -93,13 +95,18 @@ public class SpatialGridIndex : ISpatialIndex
         startX = Mathf.Clamp(startX, 0, _width - 1);
         startY = Mathf.Clamp(startY, 0, _height - 1);
 
+        float radiusSq = radius * radius;
         int searchRadius = 0;
         int maxSearchRadius = Mathf.Max(_width, _height);
         
-        // Optimization: Track the worst distance in our top K to prune early
-        // But we first need K candidates.
+        // Limit search by radius
+        if (radius != float.MaxValue)
+        {
+            int limitRadius = Mathf.CeilToInt(radius / _cellSize);
+            maxSearchRadius = Mathf.Min(maxSearchRadius, limitRadius);
+        }
 
-        while (searchRadius < maxSearchRadius)
+        while (searchRadius <= maxSearchRadius)
         {
             int minX = Mathf.Max(0, startX - searchRadius);
             int maxX = Mathf.Min(_width - 1, startX + searchRadius);
@@ -109,21 +116,21 @@ public class SpatialGridIndex : ISpatialIndex
             // Optimized Ring Loop: Only iterate the edges
             if (searchRadius == 0)
             {
-                AddCandidatesFromCell(startX, startY, position, candidates);
+                AddCandidatesFromCell(startX, startY, position, radiusSq, candidates);
             }
             else
             {
                 // Top and Bottom rows
                 for (int x = minX; x <= maxX; x++)
                 {
-                    if (minY == startY - searchRadius) AddCandidatesFromCell(x, minY, position, candidates);
-                    if (maxY == startY + searchRadius && maxY != minY) AddCandidatesFromCell(x, maxY, position, candidates);
+                    if (minY == startY - searchRadius) AddCandidatesFromCell(x, minY, position, radiusSq, candidates);
+                    if (maxY == startY + searchRadius && maxY != minY) AddCandidatesFromCell(x, maxY, position, radiusSq, candidates);
                 }
                 // Left and Right columns (excluding corners already done)
                 for (int y = minY + 1; y <= maxY - 1; y++)
                 {
-                    if (minX == startX - searchRadius) AddCandidatesFromCell(minX, y, position, candidates);
-                    if (maxX == startX + searchRadius && maxX != minX) AddCandidatesFromCell(maxX, y, position, candidates);
+                    if (minX == startX - searchRadius) AddCandidatesFromCell(minX, y, position, radiusSq, candidates);
+                    if (maxX == startX + searchRadius && maxX != minX) AddCandidatesFromCell(maxX, y, position, radiusSq, candidates);
                 }
             }
 
@@ -135,11 +142,7 @@ public class SpatialGridIndex : ISpatialIndex
                 // Distance to K-th candidate
                 float kthDistSq = candidates[k - 1].DistSq;
                 
-                // Distance to the inner edge of the *next* ring
-                // Conservative estimate: shortest distance from center cell to next ring is searchRadius * cellSize?
-                // No, (searchRadius + 1) * cellSize is the outer edge of current ring?
-                // Distance from point to the box of the next ring.
-                
+                // Distance to the inner edge of the next ring
                 float nextRingDistSq = GetDistanceToRectSq(position, 
                     (startX - (searchRadius + 1)) * _cellSize + _origin.x,
                     (startY - (searchRadius + 1)) * _cellSize + _origin.y,
@@ -156,7 +159,7 @@ public class SpatialGridIndex : ISpatialIndex
             searchRadius++;
         }
 
-        // Final sort (already sorted in loop usually, but just in case we broke early or added more)
+        // Final sort
         candidates.Sort((a, b) => a.DistSq.CompareTo(b.DistSq));
 
         int count = Mathf.Min(k, candidates.Count);
@@ -166,14 +169,17 @@ public class SpatialGridIndex : ISpatialIndex
         }
     }
 
-    private void AddCandidatesFromCell(int x, int y, Vector2 position, List<Candidate> candidates)
+    private void AddCandidatesFromCell(int x, int y, Vector2 position, float radiusSq, List<Candidate> candidates)
     {
         int cellIndex = y * _width + x;
         int current = _gridHead[cellIndex];
         while (current != -1)
         {
             float dSq = (_positions[current] - position).sqrMagnitude;
-            candidates.Add(new Candidate { Index = current, DistSq = dSq });
+            if (dSq <= radiusSq)
+            {
+                candidates.Add(new Candidate { Index = current, DistSq = dSq });
+            }
             current = _next[current];
         }
     }

@@ -11,16 +11,6 @@ public struct ORCALine
 
 /// <summary>
 /// RVO Math utilities.
-/// 
-/// DATA QUALITY REQUIREMENTS:
-/// 1. Obstacle Processing:
-///    - Obstacles neighbors provided to ConstructObstacleORCALines MUST be sorted by distance to the agent.
-///    - This is critical for the "Already Covered" optimization to work correctly and implicitly cull back-facing edges.
-///    - (Note: Current implementation of ConstructObstacleORCALines performs this sorting internally on a local copy).
-///    
-/// 2. Agent Processing:
-///    - Agent neighbors provided to ConstructORCALines SHOULD be sorted by distance.
-///    - The list MUST represent the K-nearest neighbors. Passing random neighbors instead of closest ones will lead to collisions.
 /// </summary>
 public static class RVOMath
 {
@@ -214,7 +204,6 @@ public static class RVOMath
 
     public static void ConstructORCALines(RVOAgent agent, List<RVOAgent> neighbors, float timeStep, List<ORCALine> orcaLines)
     {
-        // DO NOT CLEAR - obstacle lines were already added!
         float invTimeHorizon = 1.0f / agent.TimeHorizon;
 
         for (int i = 0; i < neighbors.Count; ++i)
@@ -232,14 +221,12 @@ public static class RVOMath
 
             if (distSq > combinedRadiusSq)
             {
-                // No collision
                 float2 w = relativeVelocity - invTimeHorizon * relativePosition;
                 float wLengthSq = absSq(w);
                 float dotProduct1 = math.dot(w, relativePosition);
 
                 if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
                 {
-                    // Project on cut-off circle
                     float wLength = math.sqrt(wLengthSq);
                     float2 unitW = w / wLength;
 
@@ -248,16 +235,13 @@ public static class RVOMath
                 }
                 else
                 {
-                    // Project on legs
                     float leg = math.sqrt(distSq - combinedRadiusSq);
                     if (det(relativePosition, w) > 0.0f)
                     {
-                        // Project on left leg
                         line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
                     }
                     else
                     {
-                        // Project on right leg
                         line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
                     }
 
@@ -267,7 +251,6 @@ public static class RVOMath
             }
             else
             {
-                // Collision
                 float invTimeStep = 1.0f / timeStep;
                 float2 w = relativeVelocity - invTimeStep * relativePosition;
                 float wLength = math.length(w);
@@ -286,42 +269,15 @@ public static class RVOMath
     {
         float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
 
-        // Note: Obstacles should ideally be sorted by distance for "Already Covered" optimization to work best.
-        // However, we iterate the provided list directly. The caller (Spatial Index) is responsible for sorting.
-
-        bool debug = agent.ID == 0;
-
-        if (debug)
-        {
-            Debug.Log($"[RVO] === Agent {agent.ID} at {agent.Position} ===");
-            Debug.Log($"[RVO] TimeHorizonObst={agent.TimeHorizonObst}, MaxSpeed={agent.MaxSpeed}, Radius={agent.Radius}");
-            Debug.Log($"[RVO] Processing {obstacles.Count} obstacles");
-        }
-
         for (int i = 0; i < obstacles.Count; ++i)
         {
             RVOObstacle obstacle1 = obstacles[i];
-
-            // In our implementation, obstacle1 represents an edge from Point1 to Point2
-            // This is different from RVO2-Unity where each Obstacle is a vertex
-            // obstacle1.Point1 is the first vertex, obstacle1.Point2 is the second vertex
             float2 vertex1 = obstacle1.Point1;
             float2 vertex2 = obstacle1.Point2;
-
-            // NOTE: RVO2-Unity uses rangeSq filtering only within its KdTree spatial structure
-            // for performance optimization. Since we iterate all obstacles directly,
-            // we skip the range check to ensure all obstacles are considered.
-            // The ORCA line generation will naturally handle which obstacles affect the agent.
 
             float2 relativePosition1 = vertex1 - agent.Position;
             float2 relativePosition2 = vertex2 - agent.Position;
 
-            if (debug)
-            {
-                Debug.Log($"[RVO]   Edge{i}: {vertex1}→{vertex2}, RelPos1={relativePosition1}, RelPos2={relativePosition2}");
-            }
-
-            // Check if velocity obstacle is already covered by previous ORCA lines
             bool alreadyCovered = false;
 
             for (int j = 0; j < orcaLines.Count; ++j)
@@ -339,24 +295,16 @@ public static class RVOMath
                 continue;
             }
 
-            // Not yet covered. Check for collisions.
             float distSq1 = absSq(relativePosition1);
             float distSq2 = absSq(relativePosition2);
             float radiusSq = agent.Radius * agent.Radius;
 
             float2 obstacleVec = vertex2 - vertex1;
-
-            // REMOVED: Explicit Back-face culling.
-            // RVO2-Unity relies on Sorting + AlreadyCovered check to skip back faces.
-            // if (det(obstacleVec, relativePosition1) < 0) { continue; }
-
             float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
             float distSqLine = absSq(-relativePosition1 - s * obstacleVec);
 
-
             ORCALine line;
 
-            // Collision with left vertex
             if (s < 0.0f && distSq1 <= radiusSq)
             {
                 if (obstacle1.IsConvex)
@@ -367,13 +315,11 @@ public static class RVOMath
                 }
                 continue;
             }
-            // Collision with right vertex
             else if (s > 1.0f && distSq2 <= radiusSq)
             {
-                // For the right vertex, we need to check the next obstacle's convexity
                 RVOObstacle nextObstacle = obstacle1.NextObstacle;
                 bool isConvex = (nextObstacle != null) ? nextObstacle.IsConvex : true;
-                float2 nextVertex = (nextObstacle != null) ? nextObstacle.Point2 : vertex2; // Fallback
+                float2 nextVertex = (nextObstacle != null) ? nextObstacle.Point2 : vertex2; 
 
                 if (isConvex && det(relativePosition2, nextVertex - vertex2) >= 0.0f)
                 {
@@ -383,7 +329,6 @@ public static class RVOMath
                 }
                 continue;
             }
-            // Collision with obstacle segment
             else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
             {
                 line.Point = new float2(0.0f, 0.0f);
@@ -392,27 +337,19 @@ public static class RVOMath
                 continue;
             }
 
-            // No collision. Compute legs (velocity obstacle tangent lines)
             float2 leftLegDirection, rightLegDirection;
-
-            // Track which obstacles define the left and right vertices where legs emanate from
-            // This is critical for foreign leg detection and cutoff center calculation
-            RVOObstacle leftVertexObstacle = obstacle1;          // Default: left leg from vertex1 (obstacle1.Point1)
-            RVOObstacle rightVertexObstacle = obstacle1.NextObstacle;  // Default: right leg from vertex2 (nextObstacle.Point1)
-
-            // Track which edge defines the cutoff line direction
-            RVOObstacle cutoffEdge = obstacle1;  // Default: original edge
+            RVOObstacle leftVertexObstacle = obstacle1;          
+            RVOObstacle rightVertexObstacle = obstacle1.NextObstacle;
+            RVOObstacle cutoffEdge = obstacle1;  
 
             if (s < 0.0f && distSqLine <= radiusSq)
             {
-                // Obstacle viewed obliquely so that left vertex defines velocity obstacle
                 if (!obstacle1.IsConvex)
                 {
-                    continue; // Ignore obstacle
+                    continue; 
                 }
 
-                // Both legs emanate from vertex1
-                rightVertexObstacle = obstacle1;  // Both legs now from vertex1
+                rightVertexObstacle = obstacle1;  
 
                 float leg1 = math.sqrt(distSq1 - radiusSq);
                 leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius,
@@ -422,19 +359,17 @@ public static class RVOMath
             }
             else if (s > 1.0f && distSqLine <= radiusSq)
             {
-                // Obstacle viewed obliquely so that right vertex defines velocity obstacle
                 RVOObstacle nextObstacle = obstacle1.NextObstacle;
                 bool isConvex = (nextObstacle != null) ? nextObstacle.IsConvex : true;
 
                 if (!isConvex)
                 {
-                    continue; // Ignore obstacle
+                    continue; 
                 }
 
-                // Both legs emanate from vertex2
-                leftVertexObstacle = nextObstacle;  // Both legs now from vertex2
+                leftVertexObstacle = nextObstacle;  
                 rightVertexObstacle = nextObstacle;
-                cutoffEdge = nextObstacle;  // Cutoff line is edge starting at vertex2
+                cutoffEdge = nextObstacle;  
 
                 float leg2 = math.sqrt(distSq2 - radiusSq);
                 leftLegDirection = new float2(relativePosition2.x * leg2 - relativePosition2.y * agent.Radius,
@@ -444,7 +379,6 @@ public static class RVOMath
             }
             else
             {
-                // Usual situation - compute legs from both vertices
                 if (obstacle1.IsConvex)
                 {
                     float leg1 = math.sqrt(distSq1 - radiusSq);
@@ -453,7 +387,6 @@ public static class RVOMath
                 }
                 else
                 {
-                    // Left vertex non-convex; left leg extends cut-off line
                     leftLegDirection = -obstacle1.Direction;
                 }
 
@@ -466,12 +399,10 @@ public static class RVOMath
                 }
                 else
                 {
-                    // Right vertex non-convex; right leg extends cut-off line
                     rightLegDirection = obstacle1.Direction;
                 }
             }
 
-            // Foreign leg detection - use the CORRECT vertex obstacles
             RVOObstacle leftNeighbor = leftVertexObstacle.PrevObstacle;
 
             bool isLeftLegForeign = false;
@@ -479,36 +410,26 @@ public static class RVOMath
 
             if (leftVertexObstacle.IsConvex && leftNeighbor != null && det(leftLegDirection, -leftNeighbor.Direction) >= 0.0f)
             {
-                // Left leg points into obstacle
                 leftLegDirection = -leftNeighbor.Direction;
                 isLeftLegForeign = true;
             }
 
             if (rightVertexObstacle != null && rightVertexObstacle.IsConvex && det(rightLegDirection, rightVertexObstacle.Direction) <= 0.0f)
             {
-                // Right leg points into obstacle
                 rightLegDirection = rightVertexObstacle.Direction;
                 isRightLegForeign = true;
             }
 
-
-            // Compute cut-off centers - MUST use the vertices where legs actually emanate from!
-            // In oblique cases, both legs may come from the same vertex
             float2 leftCutOff = invTimeHorizonObst * (leftVertexObstacle.Point1 - agent.Position);
             float2 rightCutOff = invTimeHorizonObst * (rightVertexObstacle.Point1 - agent.Position);
             float2 cutOffVector = rightCutOff - leftCutOff;
 
-            // Project current velocity on velocity obstacle
-
-            // Check if current velocity is projected on cutoff circles
-            // Special case: when both legs from same vertex (oblique), t is always 0.5
             float t = (leftVertexObstacle == rightVertexObstacle) ? 0.5f : math.dot(agent.Velocity - leftCutOff, cutOffVector) / absSq(cutOffVector);
             float tLeft = math.dot(agent.Velocity - leftCutOff, leftLegDirection);
             float tRight = math.dot(agent.Velocity - rightCutOff, rightLegDirection);
 
             if ((t < 0.0f && tLeft < 0.0f) || (leftVertexObstacle == rightVertexObstacle && tLeft < 0.0f && tRight < 0.0f))
             {
-                // Project on left cut-off circle
                 float2 unitW = normalize(agent.Velocity - leftCutOff);
                 line.Direction = new float2(unitW.y, -unitW.x);
                 line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * unitW;
@@ -517,7 +438,6 @@ public static class RVOMath
             }
             else if (t > 1.0f && tRight < 0.0f)
             {
-                // Project on right cut-off circle
                 float2 unitW = normalize(agent.Velocity - rightCutOff);
                 line.Direction = new float2(unitW.y, -unitW.x);
                 line.Point = rightCutOff + agent.Radius * invTimeHorizonObst * unitW;
@@ -525,14 +445,12 @@ public static class RVOMath
                 continue;
             }
 
-            // Project on left leg, right leg, or cut-off line (whichever is closest to velocity)
             float distSqCutoff = (t < 0.0f || t > 1.0f || leftVertexObstacle == rightVertexObstacle) ? float.PositiveInfinity : absSq(agent.Velocity - (leftCutOff + t * cutOffVector));
             float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (leftCutOff + tLeft * leftLegDirection));
             float distSqRight = tRight < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (rightCutOff + tRight * rightLegDirection));
 
             if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
             {
-                // Project on cut-off line
                 line.Direction = -cutoffEdge.Direction;
                 line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
                 orcaLines.Add(line);
@@ -540,7 +458,6 @@ public static class RVOMath
             }
             else if (distSqLeft <= distSqRight)
             {
-                // Project on left leg
                 if (isLeftLegForeign)
                 {
                     continue;
@@ -553,7 +470,6 @@ public static class RVOMath
             }
             else
             {
-                // Project on right leg
                 if (isRightLegForeign)
                 {
                     continue;

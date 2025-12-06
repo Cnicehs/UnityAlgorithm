@@ -108,24 +108,7 @@ public class QuadTreeIndex : ISpatialIndex
             
             int childIdx = 0;
             if (pos.x > midX) childIdx += 1;
-            if (pos.y > midY) childIdx += 2; // 0:TL, 1:TR, 2:BL, 3:BR (Y-up? No, standard 2D: usually 0=BL. Let's stick to logic)
-            // Let's define:
-            // 0: Left-Bottom, 1: Right-Bottom, 2: Left-Top, 3: Right-Top
-            // Wait, standard QuadTree usually:
-            // 0: NW, 1: NE, 2: SW, 3: SE
-            // Let's use:
-            // 0: minX, minY (BL)
-            // 1: maxX, minY (BR)
-            // 2: minX, maxY (TL)
-            // 3: maxX, maxY (TR)
-            
-            // Logic above:
-            // if x > mid -> 1
-            // if y > mid -> 2
-            // 0: <midX, <midY (BL)
-            // 1: >midX, <midY (BR)
-            // 2: <midX, >midY (TL)
-            // 3: >midX, >midY (TR)
+            if (pos.y > midY) childIdx += 2;
             
             int nextNode = -1;
             switch (childIdx)
@@ -197,23 +180,37 @@ public class QuadTreeIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
+        QueryKNearestSorted(position, k, float.MaxValue, results);
+    }
+
+    public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
+    {
         results.Clear();
         _candidateCache.Clear();
         if (_candidateCache.Capacity < k + 1) _candidateCache.Capacity = k + 1;
 
         _searchStack.Clear();
         _searchStack.Push(_rootIndex);
+        
+        float radiusSq = radius * radius;
 
         while (_searchStack.Count > 0)
         {
             int nodeIdx = _searchStack.Pop();
             
-            // Pruning: Dist to rect
-            float distToNode = DistToRect(position, _nodes[nodeIdx]);
+            // Pruning
+            float distSqToNode = DistSqToRect(position, _nodes[nodeIdx]);
+            
+            float cutoffSq = radiusSq;
             if (_candidateCache.Count == k)
             {
-                if (distToNode * distToNode >= _candidateCache[_candidateCache.Count - 1].distSq) continue;
+                if (_candidateCache[_candidateCache.Count - 1].distSq < cutoffSq)
+                {
+                    cutoffSq = _candidateCache[_candidateCache.Count - 1].distSq;
+                }
             }
+            
+            if (distSqToNode > cutoffSq) continue;
 
             // If leaf
             if (_nodes[nodeIdx].Child0 == -1)
@@ -222,27 +219,15 @@ public class QuadTreeIndex : ISpatialIndex
                 while (curr != -1)
                 {
                     float dSq = (_positions[curr] - position).sqrMagnitude;
-                    AddCandidate(curr, dSq, k, _candidateCache);
+                    if (dSq <= radiusSq)
+                    {
+                        AddCandidate(curr, dSq, k, _candidateCache);
+                    }
                     curr = _linkedUnits[curr];
                 }
                 continue;
             }
 
-            // Internal: Push children
-            // Order by distance? Simple optimization: push all
-            // Better: Sort children by distance
-            
-            // For simplicity, just push all. 
-            // To optimize, we should push furthest first so closest is popped first.
-            
-            // Calculate distances
-            float d0 = DistToRect(position, _nodes[_nodes[nodeIdx].Child0]);
-            float d1 = DistToRect(position, _nodes[_nodes[nodeIdx].Child1]);
-            float d2 = DistToRect(position, _nodes[_nodes[nodeIdx].Child2]);
-            float d3 = DistToRect(position, _nodes[_nodes[nodeIdx].Child3]);
-            
-            // Sort indices (0,1,2,3) by distance descending
-            // Simple manual sort or just push
             _searchStack.Push(_nodes[nodeIdx].Child0);
             _searchStack.Push(_nodes[nodeIdx].Child1);
             _searchStack.Push(_nodes[nodeIdx].Child2);
@@ -252,11 +237,11 @@ public class QuadTreeIndex : ISpatialIndex
         for (int i = 0; i < _candidateCache.Count; i++) results.Add(_candidateCache[i].index);
     }
 
-    private float DistToRect(Vector2 p, Node n)
+    private float DistSqToRect(Vector2 p, Node n)
     {
         float dx = Mathf.Max(n.X - p.x, 0, p.x - (n.X + n.W));
         float dy = Mathf.Max(n.Y - p.y, 0, p.y - (n.Y + n.H));
-        return Mathf.Sqrt(dx * dx + dy * dy);
+        return dx * dx + dy * dy;
     }
 
     private void AddCandidate(int index, float distSq, int k, List<(int index, float distSq)> best)
@@ -282,8 +267,8 @@ public class QuadTreeIndex : ISpatialIndex
         {
             int nodeIdx = _searchStack.Pop();
             
-            float dist = DistToRect(position, _nodes[nodeIdx]);
-            if (dist > radius) continue;
+            float distSq = DistSqToRect(position, _nodes[nodeIdx]);
+            if (distSq > rSq) continue;
 
             if (_nodes[nodeIdx].Child0 == -1)
             {
