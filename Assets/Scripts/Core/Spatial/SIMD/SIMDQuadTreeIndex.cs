@@ -269,7 +269,26 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        int maxCandidates = k * 10;
+        if (maxCandidates < 128) maxCandidates = 128;
+
+        int* resultBuffer = (int*)UnsafeUtility.Malloc(maxCandidates * sizeof(int), 4, Allocator.Temp);
+        int resultCount = 0;
+
+        try
+        {
+            Span<Vector2> posSpan = _positions.AsSpan();
+            fixed (Vector2* posPtr = posSpan)
+            {
+                QueryKNearestBurstExt(new float2(position.x, position.y), k, float.MaxValue, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates, false);
+            }
+            for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
+        }
+        finally
+        {
+            UnsafeUtility.Free(resultBuffer, Allocator.Temp);
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
@@ -286,7 +305,7 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurstExt(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (int*)_linkedUnits.GetUnsafePtr(), (int*)_unitIndices.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates, true);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -306,6 +325,13 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
     [BurstCompile]
     private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
     {
+        // Legacy: called by QueryNeighborsBatchBurst, always sorts
+        QueryKNearestBurstExt(position, k, radiusSq, nodes, linkedUnits, unitIndices, positions, rootIndex, results, resultCount, maxResults, true);
+    }
+    
+    [BurstCompile]
+    private static void QueryKNearestBurstExt(in float2 position, int k, float radiusSq, Node* nodes, int* linkedUnits, int* unitIndices, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults, bool sortResults)
+    {
         Candidate* candidates = (Candidate*)UnsafeUtility.Malloc(maxResults * sizeof(Candidate), 4, Allocator.Temp);
         int candidateCount = 0;
 
@@ -314,16 +340,14 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
 
         stack[stackCount++] = rootIndex;
 
-        // Optimization: Track worst distance to prune nodes early
-        float worstDistSq = radiusSq; // Start with radius as cutoff
+        float worstDistSq = radiusSq;
 
         while (stackCount > 0)
         {
             int nodeIdx = stack[--stackCount];
 
-            // Optimization: Check distance to node bounds before processing
             float distToNode = DistToRect(position, nodes[nodeIdx]);
-            if (distToNode * distToNode > worstDistSq) continue; // Use strict greater for radius pruning
+            if (distToNode * distToNode > worstDistSq) continue;
 
             if (nodes[nodeIdx].Child0 == -1)
             {
@@ -331,18 +355,11 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
                 while (curr != -1)
                 {
                     float dSq = math.distancesq(positions[curr], position);
-                    if (dSq <= radiusSq) // Radius check
+                    if (dSq <= radiusSq)
                     {
                         if (candidateCount < k || dSq < worstDistSq)
                         {
-                            AddCandidate(curr, dSq, k, candidates, &candidateCount);
-                            if (candidateCount >= k)
-                            {
-                                // Update worstDistSq based on K-th candidate
-                                // Find worst in current set (which is kept sorted by AddCandidate? No, AddCandidate inserts sorted.)
-                                // AddCandidate keeps sorted array. So worst is last.
-                                worstDistSq = candidates[candidateCount - 1].DistSq;
-                            }
+                            AddCandidateUnsorted(curr, dSq, k, candidates, &candidateCount, &worstDistSq);
                         }
                     }
                     curr = linkedUnits[curr];
@@ -364,10 +381,21 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
             }
         }
 
-        // Sort? AddCandidate keeps them sorted.
-        // But verifying sort is cheap here.
-        // Actually AddCandidate implementation:
-        // "insertPos... for loop shift..." -> Yes, it maintains sorted order.
+        // Sort only if requested
+        if (sortResults)
+        {
+            for (int i = 1; i < candidateCount; ++i)
+            {
+                Candidate key = candidates[i];
+                int j = i - 1;
+                while (j >= 0 && candidates[j].DistSq > key.DistSq)
+                {
+                    candidates[j + 1] = candidates[j];
+                    j--;
+                }
+                candidates[j + 1] = key;
+            }
+        }
         
         int finalCount = math.min(k, candidateCount);
         for (int i = 0; i < finalCount; i++) results[i] = candidates[i].Index;
@@ -376,10 +404,35 @@ public unsafe class SIMDQuadTreeIndex : ISpatialIndex, IDisposable
         UnsafeUtility.Free(candidates, Allocator.Temp);
     }
 
+    private static void AddCandidateUnsorted(int index, float distSq, int k, Candidate* candidates, int* count, float* worstDistSq)
+    {
+        if (*count < k)
+        {
+            candidates[*count] = new Candidate { Index = index, DistSq = distSq };
+            (*count)++;
+            if (distSq > *worstDistSq || *worstDistSq == float.MaxValue) *worstDistSq = distSq;
+            if (*count == k)
+            {
+                *worstDistSq = 0;
+                for (int i = 0; i < *count; i++)
+                    if (candidates[i].DistSq > *worstDistSq) *worstDistSq = candidates[i].DistSq;
+            }
+        }
+        else if (distSq < *worstDistSq)
+        {
+            int worstIdx = 0;
+            for (int i = 1; i < *count; i++)
+                if (candidates[i].DistSq > candidates[worstIdx].DistSq) worstIdx = i;
+            candidates[worstIdx] = new Candidate { Index = index, DistSq = distSq };
+            *worstDistSq = 0;
+            for (int i = 0; i < *count; i++)
+                if (candidates[i].DistSq > *worstDistSq) *worstDistSq = candidates[i].DistSq;
+        }
+    }
+
     private static void AddCandidate(int index, float distSq, int k, Candidate* candidates, int* count)
     {
         int insertPos = 0;
-        // Linear scan
         while (insertPos < *count && candidates[insertPos].DistSq < distSq) insertPos++;
 
         if (insertPos < k)

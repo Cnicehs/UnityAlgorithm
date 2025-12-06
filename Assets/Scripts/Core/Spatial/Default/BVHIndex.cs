@@ -185,7 +185,86 @@ public class BVHIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k + 1) _candidateCache.Capacity = k + 1;
+
+        // Use unsorted search - collect K nearest without maintaining sort order
+        SearchKNNUnsorted(_rootIndex, position, k, _candidateCache);
+        
+        for (int i = 0; i < _candidateCache.Count; i++) results.Add(_candidateCache[i].index);
+    }
+    
+    private void SearchKNNUnsorted(int rootIndex, Vector2 target, int k, List<(int index, float distSq)> best)
+    {
+        if (rootIndex == -1) return;
+        
+        _searchStack.Clear();
+        _searchStack.Push(new SearchJob { NodeIndex = rootIndex, MinDistSq = 0 });
+        
+        float worstDistSq = float.MaxValue;
+
+        while (_searchStack.Count > 0)
+        {
+            var job = _searchStack.Pop();
+            int nodeIdx = job.NodeIndex;
+            if (nodeIdx == -1) continue;
+
+            // Pruning
+            if (best.Count == k && job.MinDistSq > worstDistSq) continue;
+
+            // Leaf check
+            if (_nodes[nodeIdx].UnitIndex != -1)
+            {
+                float dSq = (_positions[_nodes[nodeIdx].UnitIndex] - target).sqrMagnitude;
+                AddCandidateUnsorted(_nodes[nodeIdx].UnitIndex, dSq, k, best, ref worstDistSq);
+                continue;
+            }
+
+            // Internal node: check children
+            int left = _nodes[nodeIdx].Left;
+            int right = _nodes[nodeIdx].Right;
+
+            float distLeft = DistToAABB(target, left);
+            float distRight = DistToAABB(target, right);
+
+            // Visit closest first
+            if (distLeft < distRight)
+            {
+                if (right != -1) _searchStack.Push(new SearchJob { NodeIndex = right, MinDistSq = distRight });
+                if (left != -1) _searchStack.Push(new SearchJob { NodeIndex = left, MinDistSq = distLeft });
+            }
+            else
+            {
+                if (left != -1) _searchStack.Push(new SearchJob { NodeIndex = left, MinDistSq = distLeft });
+                if (right != -1) _searchStack.Push(new SearchJob { NodeIndex = right, MinDistSq = distRight });
+            }
+        }
+    }
+    
+    private void AddCandidateUnsorted(int index, float distSq, int k, List<(int index, float distSq)> best, ref float worstDistSq)
+    {
+        if (best.Count < k)
+        {
+            best.Add((index, distSq));
+            if (distSq > worstDistSq || worstDistSq == float.MaxValue) worstDistSq = distSq;
+            if (best.Count == k)
+            {
+                worstDistSq = 0;
+                for (int i = 0; i < best.Count; i++)
+                    if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+            }
+        }
+        else if (distSq < worstDistSq)
+        {
+            int worstIdx = 0;
+            for (int i = 1; i < best.Count; i++)
+                if (best[i].distSq > best[worstIdx].distSq) worstIdx = i;
+            best[worstIdx] = (index, distSq);
+            worstDistSq = 0;
+            for (int i = 0; i < best.Count; i++)
+                if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)

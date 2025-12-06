@@ -1,7 +1,11 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public interface IObstacleSpatialIndex
+/// <summary>
+/// Spatial index interface for line segment elements (e.g., RVO obstacles).
+/// Unlike point-based ISpatialIndex, this handles geometry with extent.
+/// </summary>
+public interface ISegmentSpatialIndex
 {
     /// <summary>
     /// Rebuilds the index with the given obstacles.

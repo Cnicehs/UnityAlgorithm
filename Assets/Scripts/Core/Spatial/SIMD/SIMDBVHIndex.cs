@@ -180,7 +180,26 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        int maxCandidates = k * 10;
+        if (maxCandidates < 128) maxCandidates = 128;
+
+        int* resultBuffer = (int*)UnsafeUtility.Malloc(maxCandidates * sizeof(int), 4, Allocator.Temp);
+        int resultCount = 0;
+
+        try
+        {
+            Span<Vector2> posSpan = _positions.AsSpan();
+            fixed (Vector2* posPtr = posSpan)
+            {
+                QueryKNearestBurst(new float2(position.x, position.y), k, float.MaxValue, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates, false);
+            }
+            for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
+        }
+        finally
+        {
+            UnsafeUtility.Free(resultBuffer, Allocator.Temp);
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
@@ -197,7 +216,7 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
             Span<Vector2> posSpan = _positions.AsSpan();
             fixed (Vector2* posPtr = posSpan)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (Node*)_nodes.GetUnsafePtr(), (float2*)posPtr, _rootIndex, resultBuffer, &resultCount, maxCandidates, true);
             }
             for (int i = 0; i < resultCount; i++) results.Add(resultBuffer[i]);
         }
@@ -221,7 +240,7 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, Node* nodes, float2* positions, int rootIndex, int* results, int* resultCount, int maxResults, bool sortResults)
     {
         if (rootIndex == -1) return;
 
@@ -280,16 +299,20 @@ public unsafe class SIMDBVHIndex : ISpatialIndex, IDisposable
             }
         }
 
-        for (int i = 1; i < candidateCount; ++i)
+        // Sort results only if requested
+        if (sortResults)
         {
-            Candidate key = candidates[i];
-            int j = i - 1;
-            while (j >= 0 && candidates[j].DistSq > key.DistSq)
+            for (int i = 1; i < candidateCount; ++i)
             {
-                candidates[j + 1] = candidates[j];
-                j--;
+                Candidate key = candidates[i];
+                int j = i - 1;
+                while (j >= 0 && candidates[j].DistSq > key.DistSq)
+                {
+                    candidates[j + 1] = candidates[j];
+                    j--;
+                }
+                candidates[j + 1] = key;
             }
-            candidates[j + 1] = key;
         }
 
         int finalCount = math.min(k, candidateCount);

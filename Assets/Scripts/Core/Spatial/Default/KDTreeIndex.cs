@@ -222,8 +222,103 @@ public class KDTreeIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        // Fallback to infinite radius
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k + 1)
+        {
+            _candidateCache.Capacity = k + 1;
+        }
+        
+        // Use unsorted search - collect K nearest without maintaining sort order
+        SearchKNNUnsorted(_rootIndex, position, k, _candidateCache);
+        
+        for (int i = 0; i < _candidateCache.Count; i++)
+        {
+            results.Add(_candidateCache[i].index);
+        }
+    }
+    
+    private void SearchKNNUnsorted(int rootIndex, Vector2 target, int k, List<(int index, float distSq)> best)
+    {
+        if (rootIndex == -1) return;
+
+        _searchStack.Clear();
+        _searchStack.Push(new SearchJob { NodeIndex = rootIndex, MinDistSq = 0f });
+        
+        float worstDistSq = float.MaxValue;
+
+        while (_searchStack.Count > 0)
+        {
+            var job = _searchStack.Pop();
+            int nodeIndex = job.NodeIndex;
+            
+            if (nodeIndex == -1) continue;
+
+            // Pruning: if this branch can't improve our worst candidate, skip
+            if (best.Count == k && job.MinDistSq > worstDistSq)
+            {
+                continue;
+            }
+
+            int unitIdx = _nodes[nodeIndex].UnitIndex;
+            float distSq = (_positions[unitIdx] - target).sqrMagnitude;
+
+            // Add candidate using max-heap pattern (unsorted)
+            if (best.Count < k)
+            {
+                best.Add((unitIdx, distSq));
+                // Update worst distance
+                if (distSq > worstDistSq || worstDistSq == float.MaxValue)
+                {
+                    worstDistSq = distSq;
+                }
+                // Find new worst if we just filled the list
+                if (best.Count == k)
+                {
+                    worstDistSq = 0;
+                    for (int i = 0; i < best.Count; i++)
+                    {
+                        if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+                    }
+                }
+            }
+            else if (distSq < worstDistSq)
+            {
+                // Replace the worst candidate
+                int worstIdx = 0;
+                for (int i = 1; i < best.Count; i++)
+                {
+                    if (best[i].distSq > best[worstIdx].distSq) worstIdx = i;
+                }
+                best[worstIdx] = (unitIdx, distSq);
+                // Find new worst
+                worstDistSq = 0;
+                for (int i = 0; i < best.Count; i++)
+                {
+                    if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+                }
+            }
+
+            // Decide which side to search first
+            int axis = _nodes[nodeIndex].Axis;
+            float diff = (axis == 0) ? (target.x - _positions[unitIdx].x) : (target.y - _positions[unitIdx].y);
+            
+            int first = (diff < 0) ? _nodes[nodeIndex].Left : _nodes[nodeIndex].Right;
+            int second = (diff < 0) ? _nodes[nodeIndex].Right : _nodes[nodeIndex].Left;
+            
+            float diffSq = diff * diff;
+
+            if (second != -1)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = second, MinDistSq = diffSq });
+            }
+
+            if (first != -1)
+            {
+                _searchStack.Push(new SearchJob { NodeIndex = first, MinDistSq = 0f });
+            }
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)

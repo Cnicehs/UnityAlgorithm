@@ -180,7 +180,74 @@ public class QuadTreeIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k + 1) _candidateCache.Capacity = k + 1;
+
+        // Use unsorted search - collect K nearest without maintaining sort order
+        SearchKNNUnsorted(position, k, _candidateCache);
+        
+        for (int i = 0; i < _candidateCache.Count; i++) results.Add(_candidateCache[i].index);
+    }
+    
+    private void SearchKNNUnsorted(Vector2 position, int k, List<(int index, float distSq)> best)
+    {
+        _searchStack.Clear();
+        _searchStack.Push(_rootIndex);
+        
+        float worstDistSq = float.MaxValue;
+
+        while (_searchStack.Count > 0)
+        {
+            int nodeIdx = _searchStack.Pop();
+            
+            // Pruning
+            float distSqToNode = DistSqToRect(position, _nodes[nodeIdx]);
+            if (best.Count == k && distSqToNode > worstDistSq) continue;
+
+            // If leaf
+            if (_nodes[nodeIdx].Child0 == -1)
+            {
+                int curr = _nodes[nodeIdx].FirstUnit;
+                while (curr != -1)
+                {
+                    float dSq = (_positions[curr] - position).sqrMagnitude;
+                    AddCandidateUnsorted(curr, dSq, k, best, ref worstDistSq);
+                    curr = _linkedUnits[curr];
+                }
+                continue;
+            }
+
+            _searchStack.Push(_nodes[nodeIdx].Child0);
+            _searchStack.Push(_nodes[nodeIdx].Child1);
+            _searchStack.Push(_nodes[nodeIdx].Child2);
+            _searchStack.Push(_nodes[nodeIdx].Child3);
+        }
+    }
+    
+    private void AddCandidateUnsorted(int index, float distSq, int k, List<(int index, float distSq)> best, ref float worstDistSq)
+    {
+        if (best.Count < k)
+        {
+            best.Add((index, distSq));
+            if (distSq > worstDistSq || worstDistSq == float.MaxValue) worstDistSq = distSq;
+            if (best.Count == k)
+            {
+                worstDistSq = 0;
+                for (int i = 0; i < best.Count; i++)
+                    if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+            }
+        }
+        else if (distSq < worstDistSq)
+        {
+            int worstIdx = 0;
+            for (int i = 1; i < best.Count; i++)
+                if (best[i].distSq > best[worstIdx].distSq) worstIdx = i;
+            best[worstIdx] = (index, distSq);
+            worstDistSq = 0;
+            for (int i = 0; i < best.Count; i++)
+                if (best[i].distSq > worstDistSq) worstDistSq = best[i].distSq;
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)

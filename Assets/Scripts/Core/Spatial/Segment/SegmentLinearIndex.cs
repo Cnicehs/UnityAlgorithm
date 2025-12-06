@@ -2,14 +2,18 @@ using System.Collections.Generic;
 using UnityEngine;
 using Unity.Mathematics;
 
-public class SimpleObstacleIndex : IObstacleSpatialIndex
+/// <summary>
+/// Simple linear scan spatial index for line segments.
+/// O(N) query time, useful for small obstacle counts or as a baseline.
+/// </summary>
+public class SegmentLinearIndex : ISegmentSpatialIndex
 {
     private List<RVOObstacle> _obstacles;
 
     public void Build(List<RVOObstacle> obstacles)
     {
         // Reference copy is fine as we don't modify obstacles, only sort a query result
-        _obstacles = obstacles; 
+        _obstacles = obstacles;
     }
 
     public void QueryNearest(Vector2 position, List<RVOObstacle> results)

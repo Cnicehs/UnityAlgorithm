@@ -75,7 +75,107 @@ public class SpatialGridIndex : ISpatialIndex
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        
+        _candidateCache.Clear();
+        if (_candidateCache.Capacity < k * 4) _candidateCache.Capacity = k * 4;
+        var candidates = _candidateCache;
+
+        int startX = Mathf.FloorToInt((position.x - _origin.x) / _cellSize);
+        int startY = Mathf.FloorToInt((position.y - _origin.y) / _cellSize);
+        
+        startX = Mathf.Clamp(startX, 0, _width - 1);
+        startY = Mathf.Clamp(startY, 0, _height - 1);
+
+        float worstDistSq = float.MaxValue;
+        int searchRadius = 0;
+        int maxSearchRadius = Mathf.Max(_width, _height);
+
+        while (searchRadius <= maxSearchRadius)
+        {
+            int minX = Mathf.Max(0, startX - searchRadius);
+            int maxX = Mathf.Min(_width - 1, startX + searchRadius);
+            int minY = Mathf.Max(0, startY - searchRadius);
+            int maxY = Mathf.Min(_height - 1, startY + searchRadius);
+
+            // Ring Loop
+            if (searchRadius == 0)
+            {
+                AddCandidatesFromCellUnsorted(startX, startY, position, k, candidates, ref worstDistSq);
+            }
+            else
+            {
+                for (int x = minX; x <= maxX; x++)
+                {
+                    if (minY == startY - searchRadius) AddCandidatesFromCellUnsorted(x, minY, position, k, candidates, ref worstDistSq);
+                    if (maxY == startY + searchRadius && maxY != minY) AddCandidatesFromCellUnsorted(x, maxY, position, k, candidates, ref worstDistSq);
+                }
+                for (int y = minY + 1; y <= maxY - 1; y++)
+                {
+                    if (minX == startX - searchRadius) AddCandidatesFromCellUnsorted(minX, y, position, k, candidates, ref worstDistSq);
+                    if (maxX == startX + searchRadius && maxX != minX) AddCandidatesFromCellUnsorted(maxX, y, position, k, candidates, ref worstDistSq);
+                }
+            }
+
+            if (candidates.Count >= k)
+            {
+                // Distance to the inner edge of the next ring
+                float nextRingDistSq = GetDistanceToRectSq(position, 
+                    (startX - (searchRadius + 1)) * _cellSize + _origin.x,
+                    (startY - (searchRadius + 1)) * _cellSize + _origin.y,
+                    (startX + (searchRadius + 1) + 1) * _cellSize + _origin.x,
+                    (startY + (searchRadius + 1) + 1) * _cellSize + _origin.y
+                );
+
+                if (worstDistSq <= nextRingDistSq)
+                {
+                    break;
+                }
+            }
+            
+            searchRadius++;
+        }
+
+        // Return unsorted results (up to k)
+        int count = Mathf.Min(k, candidates.Count);
+        for (int i = 0; i < count; i++)
+        {
+            results.Add(candidates[i].Index);
+        }
+    }
+    
+    private void AddCandidatesFromCellUnsorted(int x, int y, Vector2 position, int k, List<Candidate> candidates, ref float worstDistSq)
+    {
+        int cellIndex = y * _width + x;
+        int current = _gridHead[cellIndex];
+        while (current != -1)
+        {
+            float dSq = (_positions[current] - position).sqrMagnitude;
+            
+            if (candidates.Count < k)
+            {
+                candidates.Add(new Candidate { Index = current, DistSq = dSq });
+                if (dSq > worstDistSq || worstDistSq == float.MaxValue) worstDistSq = dSq;
+                if (candidates.Count == k)
+                {
+                    worstDistSq = 0;
+                    for (int i = 0; i < candidates.Count; i++)
+                        if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+                }
+            }
+            else if (dSq < worstDistSq)
+            {
+                int worstIdx = 0;
+                for (int i = 1; i < candidates.Count; i++)
+                    if (candidates[i].DistSq > candidates[worstIdx].DistSq) worstIdx = i;
+                candidates[worstIdx] = new Candidate { Index = current, DistSq = dSq };
+                worstDistSq = 0;
+                for (int i = 0; i < candidates.Count; i++)
+                    if (candidates[i].DistSq > worstDistSq) worstDistSq = candidates[i].DistSq;
+            }
+            
+            current = _next[current];
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)

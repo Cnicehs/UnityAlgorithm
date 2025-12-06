@@ -153,7 +153,29 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
     public void QueryKNearest(Vector2 position, int k, List<int> results)
     {
-        QueryKNearestSorted(position, k, float.MaxValue, results);
+        results.Clear();
+        int maxCandidates = k * 10;
+        if (maxCandidates < 128) maxCandidates = 128;
+
+        int* resultBuffer = (int*)UnsafeUtility.Malloc(maxCandidates * sizeof(int), 4, Allocator.Temp);
+        int resultCount = 0;
+
+        try
+        {
+            fixed (float2* originPtr = &_origin)
+            {
+                QueryKNearestBurst(new float2(position.x, position.y), k, float.MaxValue, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates, false);
+            }
+
+            for (int i = 0; i < resultCount; i++)
+            {
+                results.Add(resultBuffer[i]);
+            }
+        }
+        finally
+        {
+            UnsafeUtility.Free(resultBuffer, Allocator.Temp);
+        }
     }
 
     public void QueryKNearestSorted(Vector2 position, int k, float radius, List<int> results)
@@ -169,7 +191,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         {
             fixed (float2* originPtr = &_origin)
             {
-                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates);
+                QueryKNearestBurst(new float2(position.x, position.y), k, radius * radius, (float2*)_sortedPositions.GetUnsafePtr(), (int*)_originalIndices.GetUnsafePtr(), (int*)_cellStart.GetUnsafePtr(), (int*)_cellCount.GetUnsafePtr(), _width, _height, _cellSize, originPtr, resultBuffer, &resultCount, maxCandidates, true);
             }
 
             for (int i = 0; i < resultCount; i++)
@@ -196,7 +218,7 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
     }
 
     [BurstCompile]
-    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults)
+    private static void QueryKNearestBurst(in float2 position, int k, float radiusSq, float2* sortedPositions, int* originalIndices, int* cellStart, int* cellCount, int width, int height, float cellSize, [NoAlias] float2* originPtr, int* results, int* resultCount, int maxResults, bool sortResults)
     {
         float2 origin = *originPtr;
         int startX = (int)((position.x - origin.x) / cellSize);
@@ -208,7 +230,6 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         int searchRadius = 0;
         int maxSearchRadius = math.max(width, height);
         
-        // Limit maxSearchRadius
         if (radiusSq != float.MaxValue)
         {
             int limit = (int)(math.sqrt(radiusSq) / cellSize) + 1;
@@ -220,19 +241,17 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
         float4 target4 = new float4(position.x, position.y, position.x, position.y);
 
-        while (searchRadius <= maxSearchRadius) // <= to allow reaching limit
+        while (searchRadius <= maxSearchRadius)
         {
             int rMinX = math.max(0, startX - searchRadius);
             int rMaxX = math.min(width - 1, startX + searchRadius);
             int rMinY = math.max(0, startY - searchRadius);
             int rMaxY = math.min(height - 1, startY + searchRadius);
 
-            // Process cells
             for (int y = rMinY; y <= rMaxY; y++)
             {
                 for (int x = rMinX; x <= rMaxX; x++)
                 {
-                    // Process only the ring
                     if (searchRadius > 0 && x > rMinX && x < rMaxX && y > rMinY && y < rMaxY) continue;
 
                     int cellIndex = y * width + x;
@@ -255,7 +274,6 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
                             float2 dists0 = sq0.xz + sq0.yw;
                             float2 dists1 = sq1.xz + sq1.yw;
                             
-                            // Check radius
                             if (dists0.x <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i], DistSq = dists0.x };
                             if (dists0.y <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 1], DistSq = dists0.y };
                             if (dists1.x <= radiusSq) if (candidateCount < maxResults) candidates[candidateCount++] = new Candidate { Index = originalIndices[start + i + 2], DistSq = dists1.x };
@@ -278,8 +296,9 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
 
             if (candidateCount >= k)
             {
-                SortCandidates(candidates, candidateCount);
-                float kthDistSq = candidates[k - 1].DistSq;
+                // Need to check if we can terminate early
+                // First find K-th smallest without full sort
+                float kthDistSq = FindKthSmallest(candidates, candidateCount, k - 1);
 
                 float nextRingDistSq = GetDistanceToRectSq(position,
                     (startX - (searchRadius + 1)) * cellSize + origin.x,
@@ -293,9 +312,13 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
             searchRadius++;
         }
 
-        SortCandidates(candidates, candidateCount);
+        // Sort only if requested
+        if (sortResults)
+        {
+            SortCandidates(candidates, candidateCount);
+        }
+        
         int finalCount = math.min(k, candidateCount);
-
         for (int i = 0; i < finalCount; i++)
         {
             results[i] = candidates[i].Index;
@@ -303,6 +326,28 @@ public unsafe class SIMDHashGridIndex : ISpatialIndex, IDisposable
         *resultCount = finalCount;
 
         UnsafeUtility.Free(candidates, Allocator.Temp);
+    }
+    
+    // Quick select to find K-th smallest element
+    private static float FindKthSmallest(Candidate* arr, int count, int k)
+    {
+        if (count <= k) return float.MaxValue;
+        
+        // Simple approach: partial sort for small K
+        // Just find the k-th element by scanning
+        float kth = float.MaxValue;
+        int found = 0;
+        for (int i = 0; i < count && found <= k; i++)
+        {
+            float val = arr[i].DistSq;
+            int rank = 0;
+            for (int j = 0; j < count; j++)
+            {
+                if (arr[j].DistSq < val || (arr[j].DistSq == val && j < i)) rank++;
+            }
+            if (rank == k) return val;
+        }
+        return kth;
     }
 
     private static void SortCandidates(Candidate* arr, int count)
