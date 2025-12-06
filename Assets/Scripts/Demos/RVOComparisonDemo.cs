@@ -3,13 +3,15 @@ using UnityEngine;
 using Unity.Mathematics;
 using Random = UnityEngine.Random;
 
-public class RVODemo : MonoBehaviour
+public class RVOComparisonDemo : ComparisonDemoBase
 {
-    public bool UseSIMD = true;
-    public int AgentCount = 100;
+    [Header("RVO Settings")]
     public float WorldSize = 50f;
     public float AgentRadius = 0.5f;
     public float AgentSpeed = 2.0f;
+    public int SpawnCount = 100;
+    
+    [Header("Debug")]
     public bool ShowDebugGizmos = false;
     public SpatialStructureType SpatialIndexType = SpatialStructureType.SIMDKDTree;
     [Range(1, 200)]
@@ -22,6 +24,8 @@ public class RVODemo : MonoBehaviour
 
     void Start()
     {
+        AgentCount = SpawnCount;
+        
         // Initialize Managers
         SpatialIndexManager.Instance.StructureType = SpatialIndexType;
         SpatialIndexManager.Instance.GridResolution = GridResolution;
@@ -29,7 +33,7 @@ public class RVODemo : MonoBehaviour
         
         RVOSimulator.Instance.Radius = AgentRadius;
         RVOSimulator.Instance.MaxSpeed = AgentSpeed;
-        RVOSimulator.Instance.NeighborDist = AgentRadius * 4; // Increase neighbor detection range
+        RVOSimulator.Instance.NeighborDist = AgentRadius * 4; 
 
         SIMDRVOSimulator.Instance.Radius = AgentRadius;
         SIMDRVOSimulator.Instance.MaxSpeed = AgentSpeed;
@@ -78,19 +82,16 @@ public class RVODemo : MonoBehaviour
 
         Destroy(template);
     }
+    
+    protected override void OnSIMDChanged(bool useSIMD)
+    {
+        // When switching, we can try to sync state, but for simplicity we rely on the continuous updates loop
+        // to pick up from where it was (roughly).
+        // Or re-spawn.
+    }
 
     void Update()
     {
-        // Sync Inspector changes to Manager
-        if (SpatialIndexManager.Instance.StructureType != SpatialIndexType)
-        {
-            SpatialIndexManager.Instance.StructureType = SpatialIndexType;
-        }
-        if (SpatialIndexManager.Instance.GridResolution != GridResolution)
-        {
-            SpatialIndexManager.Instance.GridResolution = GridResolution;
-        }
-
         float dt = Time.deltaTime;
 
         if (UseSIMD)
@@ -99,17 +100,17 @@ public class RVODemo : MonoBehaviour
             SpatialIndexManager.Instance.UpdatePositions(_positions);
             
             SIMDRVOSimulator.Instance.Step(dt);
+            ExecutionTimeMs = SIMDRVOSimulator.Instance.TotalStepTimeMs;
+
             for (int i = 0; i < AgentCount; i++)
             {
                 Vector2 vel = SIMDRVOSimulator.Instance.GetNewVelocity(i);
                 Vector2 pos = _positions[i] + vel * dt;
                 _positions[i] = pos;
                 
-                // Update SIMD data for next frame
-                // Recalculate pref velocity (simple target seeking)
+                // Recalculate pref velocity
                 Vector2 startPos = new Vector2(Mathf.Cos((float)i / AgentCount * 2 * Mathf.PI), Mathf.Sin((float)i / AgentCount * 2 * Mathf.PI)) * (WorldSize * 0.4f);
                 Vector2 goal = -startPos;
-                
                 Vector2 toGoal = goal - pos;
                 float dist = toGoal.magnitude;
                 Vector2 prefVel = dist > 1.0f ? toGoal.normalized * AgentSpeed : Vector2.zero;
@@ -122,16 +123,12 @@ public class RVODemo : MonoBehaviour
         }
         else
         {
-            // Sync positions from RVOSimulator to _positions list for spatial index
             for (int i = 0; i < AgentCount; i++)
             {
                 _positions[i] = RVOSimulator.Instance.GetAgentPosition(i);
             }
-            
-            // Update Spatial Index with current positions BEFORE RVO step
             SpatialIndexManager.Instance.UpdatePositions(_positions);
             
-            // Update Standard Pref Velocities
             for (int i = 0; i < AgentCount; i++)
             {
                 Vector2 pos = RVOSimulator.Instance.GetAgentPosition(i);
@@ -144,16 +141,17 @@ public class RVODemo : MonoBehaviour
             }
 
             RVOSimulator.Instance.Step(dt);
+            ExecutionTimeMs = RVOSimulator.Instance.TotalStepTimeMs;
 
             for (int i = 0; i < AgentCount; i++)
             {
                 Vector2 pos = RVOSimulator.Instance.GetAgentPosition(i);
-                _positions[i] = pos; // Sync positions for next frame
+                _positions[i] = pos; 
                 _agentVisuals[i].transform.position = new Vector3(pos.x, 0, pos.y);
             }
         }
         
-        // Debug: Query neighbors for first agent
+        // Debug...
         if (ShowDebugGizmos && _positions.Count > 0)
         {
             _debugNeighbors.Clear();
@@ -161,20 +159,33 @@ public class RVODemo : MonoBehaviour
         }
     }
 
+    protected override void OnGUIDisplayExtra()
+    {
+        if (UseSIMD)
+        {
+            GUILayout.Label($"Neighbor Query: {SIMDRVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
+            GUILayout.Label($"RVO Compute: {SIMDRVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
+        }
+        else
+        {
+            GUILayout.Label($"Neighbor Query: {RVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
+            GUILayout.Label($"RVO Compute: {RVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
+            GUILayout.Label($"Pos Update: {RVOSimulator.Instance.PositionUpdateTimeMs:F3} ms");
+        }
+        GUILayout.Label($"Spatial Build: {SpatialIndexManager.Instance.BuildTimeMs:F3} ms");
+    }
+
     private void OnDrawGizmos()
     {
-        if (!ShowDebugGizmos || _positions.Count == 0) return;
+       if (!ShowDebugGizmos || _positions.Count == 0) return;
         
-        // Draw debug agent in green
         Gizmos.color = Color.green;
         Vector3 debugPos = new Vector3(_positions[_debugAgentIndex].x, 0.5f, _positions[_debugAgentIndex].y);
         Gizmos.DrawWireSphere(debugPos, AgentRadius * 1.5f);
         
-        // Draw neighbor detection radius
         Gizmos.color = Color.yellow;
         Gizmos.DrawWireSphere(debugPos, AgentRadius * 4);
         
-        // Draw neighbors in red
         Gizmos.color = Color.red;
         foreach (int idx in _debugNeighbors)
         {
@@ -185,71 +196,6 @@ public class RVODemo : MonoBehaviour
                 Gizmos.DrawWireSphere(neighborPos, AgentRadius);
             }
         }
-    }
-
-    private void OnGUI()
-    {
-        GUILayout.BeginArea(new Rect(10, 10, 450, 400));
-        GUILayout.Label($"RVO Demo - {(UseSIMD ? "SIMD" : "Standard")} Mode");
-        GUILayout.Label($"Agents: {AgentCount}");
-        
-        GUILayout.BeginHorizontal();
-        GUILayout.Label($"Spatial Index: {SpatialIndexManager.Instance.StructureType}", GUILayout.Width(250));
-        if (GUILayout.Button("Change", GUILayout.Width(60)))
-        {
-            var types = (SpatialStructureType[])System.Enum.GetValues(typeof(SpatialStructureType));
-            int current = System.Array.IndexOf(types, SpatialIndexManager.Instance.StructureType);
-            int next = (current + 1) % types.Length;
-            SpatialIndexManager.Instance.StructureType = types[next];
-            SpatialIndexType = types[next];
-        }
-        GUILayout.EndHorizontal();
-
-        if (SpatialIndexManager.Instance.StructureType == SpatialStructureType.Grid ||
-            SpatialIndexManager.Instance.StructureType == SpatialStructureType.SIMDHashGrid)
-        {
-            GUILayout.BeginHorizontal();
-            GUILayout.Label($"Grid Res: {SpatialIndexManager.Instance.GridResolution}", GUILayout.Width(100));
-            float newRes = GUILayout.HorizontalSlider(SpatialIndexManager.Instance.GridResolution, 10, 200);
-            if ((int)newRes != SpatialIndexManager.Instance.GridResolution)
-            {
-                SpatialIndexManager.Instance.GridResolution = (int)newRes;
-                GridResolution = (int)newRes;
-            }
-            GUILayout.EndHorizontal();
-        }
-
-        GUILayout.Label($"FPS: {1.0f/Time.smoothDeltaTime:F1}");
-        
-        GUILayout.Space(10);
-        GUILayout.Label("=== Spatial Index Performance ===");
-        GUILayout.Label($"Build Time: {SpatialIndexManager.Instance.BuildTimeMs:F3} ms");
-        GUILayout.Label($"Building: {(SpatialIndexManager.Instance.IsBuilding ? "Yes" : "No")}");
-        
-        GUILayout.Space(10);
-        if (UseSIMD)
-        {
-            GUILayout.Label("=== SIMD RVO Performance ===");
-            GUILayout.Label($"Neighbor Query: {SIMDRVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
-            GUILayout.Label($"RVO Compute (Burst): {SIMDRVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
-            GUILayout.Label($"Total Step: {SIMDRVOSimulator.Instance.TotalStepTimeMs:F3} ms");
-        }
-        else
-        {
-            GUILayout.Label("=== Standard RVO Performance ===");
-            GUILayout.Label($"Neighbor Query: {RVOSimulator.Instance.NeighborQueryTimeMs:F3} ms");
-            GUILayout.Label($"RVO Compute: {RVOSimulator.Instance.RVOComputeTimeMs:F3} ms");
-            GUILayout.Label($"Position Update: {RVOSimulator.Instance.PositionUpdateTimeMs:F3} ms");
-            GUILayout.Label($"Total Step: {RVOSimulator.Instance.TotalStepTimeMs:F3} ms");
-        }
-        
-        if (ShowDebugGizmos)
-        {
-            GUILayout.Space(10);
-            GUILayout.Label($"Debug Agent: {_debugAgentIndex}");
-            GUILayout.Label($"Neighbors: {_debugNeighbors.Count}");
-        }
-        GUILayout.EndArea();
     }
 
     private void OnDestroy()

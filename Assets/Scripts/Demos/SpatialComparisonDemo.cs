@@ -6,12 +6,12 @@ using Debug = UnityEngine.Debug;
 using System;
 using Random = UnityEngine.Random;
 
-public class SpatialDemo : MonoBehaviour
+public class SpatialComparisonDemo : ComparisonDemoBase
 {
-    [Header("Settings")]
-    public int UnitCount = 10000;
+    [Header("Spatial Settings")]
     public float WorldSize = 100f;
     public float UnitSpeed = 5f;
+    public int SpawnCount = 5000;
     
     [Header("Query Settings")]
     public bool PerformQueries = true;
@@ -26,9 +26,12 @@ public class SpatialDemo : MonoBehaviour
 
     void Start()
     {
+        AgentCount = SpawnCount;
         SpawnUnits();
+        
         // Initialize SpatialIndexManager
-        SpatialIndexManager.Instance.Initialize(UnitCount, WorldSize);
+        SpatialIndexManager.Instance.Initialize(AgentCount, WorldSize);
+        UpdateStructureType();
     }
 
     void Update()
@@ -43,7 +46,28 @@ public class SpatialDemo : MonoBehaviour
         // 3. Perform Queries
         if (PerformQueries && _units.Count > 0)
         {
+            Stopwatch.Restart();
             PerformQuery();
+            Stopwatch.Stop();
+            ExecutionTimeMs = (float)Stopwatch.Elapsed.TotalMilliseconds;
+        }
+    }
+
+    protected override void OnSIMDChanged(bool useSIMD)
+    {
+        UpdateStructureType();
+    }
+
+    private void UpdateStructureType()
+    {
+        if (UseSIMD)
+        {
+            // Defaulting to QuadTree for comparison, could add a dropdown for others
+            SpatialIndexManager.Instance.StructureType = SpatialStructureType.SIMDQuadTree;
+        }
+        else
+        {
+            SpatialIndexManager.Instance.StructureType = SpatialStructureType.QuadTree;
         }
     }
 
@@ -59,7 +83,7 @@ public class SpatialDemo : MonoBehaviour
         GameObject template = GameObject.CreatePrimitive(PrimitiveType.Quad);
         Destroy(template.GetComponent<Collider>());
         
-        for (int i = 0; i < UnitCount; i++)
+        for (int i = 0; i < AgentCount; i++)
         {
             Vector2 pos = new Vector2(Random.Range(-WorldSize/2, WorldSize/2), Random.Range(-WorldSize/2, WorldSize/2));
             GameObject go = Instantiate(template, pos, Quaternion.identity);
@@ -97,15 +121,12 @@ public class SpatialDemo : MonoBehaviour
         SpatialIndexManager.Instance.QueryKNearest(heroPos, QueryK, _heroQueryResults);
     }
 
-    private void OnGUI()
+    protected override void OnGUIDisplayExtra()
     {
-        GUILayout.BeginArea(new Rect(10, 10, 300, 250));
-        GUILayout.Label($"Units: {UnitCount}");
         GUILayout.Label($"Structure: {SpatialIndexManager.Instance.StructureType}");
         GUILayout.Label($"Multi-Threading: {(SpatialIndexManager.Instance.UseMultiThreading ? "ON" : "OFF")}");
         GUILayout.Label($"Build Time: {SpatialIndexManager.Instance.BuildTimeMs:F2} ms {(SpatialIndexManager.Instance.IsBuilding ? "(Building...)" : "")}");
-        GUILayout.Label($"FPS: {1.0f/Time.smoothDeltaTime:F1}");
-        GUILayout.EndArea();
+        GUILayout.Label($"Query Time (K={QueryK}): {ExecutionTimeMs:F2} ms");
     }
 
     private void OnDrawGizmos()
