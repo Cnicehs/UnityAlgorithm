@@ -1,8 +1,7 @@
-# entity Specification
+# entity Specification Delta
 
-## Purpose
-TBD - created by archiving change add-entity-system. Update Purpose after archive.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: Data-Oriented Component Storage
 
 Components MUST be stored in contiguous memory (NativeArrays) using a Dictionary-mapped Dense Array pattern to support both SIMD processing and scalable, sparse Entity IDs.
@@ -28,6 +27,8 @@ Existing systems (RVO, Pathfinding) MUST operate on the central component data u
 - **AND** processes it with SIMD jobs
 
 ---
+
+## ADDED Requirements
 
 ### Requirement: Safe Component Access
 Systems MUST be able to access components via `ref`/`ref readonly` without requiring unsafe code.
@@ -61,4 +62,3 @@ The system MUST allow creating Entities with specific IDs to support synchroniza
 - **WHEN** `CreateEntity(1005)` is called
 - **THEN** an Entity with ID 1005 is created
 - **AND** subsequent auto-generated IDs will skip 1005 to avoid collision.
-

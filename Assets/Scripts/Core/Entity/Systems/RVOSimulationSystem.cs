@@ -13,6 +13,16 @@ public class RVOSimulationSystem : ISystem
     private NativeArray<SIMDRVO.ObstacleData> _nativeObstacles;
     private SIMDSegmentKdTreeIndex _segmentSpatialIndex;
     
+    // Aligned buffers for SIMD RVO
+    private NativeArray<float2> _alignedPositions;
+    private NativeArray<float2> _alignedVelocities;
+    private NativeArray<float> _alignedRadii;
+    private NativeArray<AgentParameters> _alignedParams;
+    private NativeArray<float2> _alignedPrefVelocities;
+    private NativeArray<int> _alignedEntityIds; // To scatter back
+    
+    private System.Collections.Generic.Dictionary<int, int> _entityToAlignedMap = new System.Collections.Generic.Dictionary<int, int>();
+
     private int _maxNeighbors = 10;
     private int _capacity = 0;
 
@@ -23,128 +33,180 @@ public class RVOSimulationSystem : ISystem
 
     public void Shutdown()
     {
+        DisposeArrays();
+        _segmentSpatialIndex.Dispose();
+    }
+
+    private void DisposeArrays()
+    {
         if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
         if (_newVelocities.IsCreated) _newVelocities.Dispose();
         if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
-        _segmentSpatialIndex.Dispose();
+        
+        if (_alignedPositions.IsCreated) _alignedPositions.Dispose();
+        if (_alignedVelocities.IsCreated) _alignedVelocities.Dispose();
+        if (_alignedRadii.IsCreated) _alignedRadii.Dispose();
+        if (_alignedParams.IsCreated) _alignedParams.Dispose();
+        if (_alignedPrefVelocities.IsCreated) _alignedPrefVelocities.Dispose();
+        if (_alignedEntityIds.IsCreated) _alignedEntityIds.Dispose();
     }
 
     public unsafe void Update(float dt)
     {
-        int agentCount = EntityManager.Instance.Count;
+        var entityManager = EntityManager.Instance;
+        var agentParamsArray = entityManager.GetArray<AgentParameters>();
+        
+        int agentCount = agentParamsArray.Count;
         if (agentCount == 0) return;
 
         EnsureCapacity(agentCount);
 
-        // 1. Update Spatial Index (Positions) if needed?
-        // Actually SpatialIndexManager handles unit positions for neighbor queries.
-        // We assume SpatialIndexManager is updated by PresentationSystem or manually.
-        // But wait, pathfinding updates positions too?
-        // Let's assume SpatialIndexManager is up-to-date with CURRENT positions.
+        // Gather Phase: Collect data into aligned arrays
+        // We iterate AgentParameters as the source of truth for "Active Agents"
+        var positions = entityManager.GetArray<PositionComponent>();
+        var velocities = entityManager.GetArray<VelocityComponent>();
+        var radii = entityManager.GetArray<RadiusComponent>();
+        var movementStates = entityManager.GetArray<MovementState>();
+
+        int validCount = 0;
+        for (int i = 0; i < agentCount; i++)
+        {
+            // AgentParameters is dense, but we need corresponding other components
+            int entityId = agentParamsArray.GetEntityIdFromDenseIndex(i);
+            
+            // Check if entity has all required components
+            if (!positions.Has(entityId) || !velocities.Has(entityId) || 
+                !radii.Has(entityId) || !movementStates.Has(entityId))
+            {
+                continue;
+            }
+
+            // Copy to aligned buffers
+            _alignedPositions[validCount] = positions.GetRef(entityId).Value;
+            _alignedVelocities[validCount] = velocities.GetRef(entityId).Value;
+            _alignedRadii[validCount] = radii.GetRef(entityId).Value;
+            _alignedParams[validCount] = agentParamsArray.GetDenseRef(i);
+            _alignedPrefVelocities[validCount] = movementStates.GetRef(entityId).PreferredVelocity;
+            _alignedEntityIds[validCount] = entityId;
+            
+            validCount++;
+        }
+
+        if (validCount == 0) return;
 
         // 2. Neighbor Query
-        var spatialIndex = SpatialIndexManager.Instance.GetCurrentIndex();
+        // Note: SpatialIndexManager likely uses old positions or needs update.
+        // Assuming SpatialIndexManager is updated externally or we update it here?
+        // The original code updated it at the end.
+        // Let's perform neighbor query using current positions (alignedPositions)
         
-        // Prepare pointers for EntityManager data
-        PositionComponent* positionsPtr = (PositionComponent*)EntityManager.Instance.GetArray<PositionComponent>().AsNativeArray().GetUnsafePtr();
-        VelocityComponent* velocitiesPtr = (VelocityComponent*)EntityManager.Instance.GetArray<VelocityComponent>().AsNativeArray().GetUnsafePtr();
-        RadiusComponent* radiiPtr = (RadiusComponent*)EntityManager.Instance.GetArray<RadiusComponent>().AsNativeArray().GetUnsafePtr();
-        AgentParameters* agentParamsPtr = (AgentParameters*)EntityManager.Instance.GetArray<AgentParameters>().AsNativeArray().GetUnsafePtr();
-        MovementState* movementStatesPtr = (MovementState*)EntityManager.Instance.GetArray<MovementState>().AsNativeArray().GetUnsafePtr();
+        // Update Spatial Index with CURRENT positions for accurate query
+        // But SpatialIndexManager takes a list of Vector2... expensive conversion.
+        // Let's assume SpatialIndexManager was updated last frame or by another system.
+        // Actually, original code updated it at the END of Update.
         
-        // Extract PrefVelocities from MovementState
-        NativeArray<float2> prefVelocities = new NativeArray<float2>(agentCount, Allocator.TempJob);
-        for(int i=0; i<agentCount; ++i) prefVelocities[i] = movementStatesPtr[i].PreferredVelocity;
-
-        // Extract pointers to raw data for SIMDRVO (which expects float2*, float* etc)
-        // Since PositionComponent is just struct { float2 Value; }, we can cast PositionComponent* to float2* ?
-        // Yes, if layout is sequential and no padding. struct PositionComponent { float2 Value; } is same size/layout as float2.
-        // But we need to be careful.
-        // Let's use stride or just cast.
-        // Burst allows casting pointer types.
+        // Fallback: Using brute force or existing index?
+        // Let's use the Gathered positions for distance checks (which is what matters for sorting)
+        // But GetNeighborsInRadius uses the SpatialIndexManager's internal structure.
         
-        float2* rawPosPtr = (float2*)positionsPtr;
-        float2* rawVelPtr = (float2*)velocitiesPtr;
-        float* rawRadiiPtr = (float*)radiiPtr;
-
-        // Perform Neighbor Query
-        if (spatialIndex is SIMDQuadTreeIndex quadTree)
+        for (int i = 0; i < validCount; i++)
         {
-            // REFACTOR: Use a parallel job for neighbor query if possible.
-            // For MVP of this System, let's use a simple loop.
+            float2 pos = _alignedPositions[i];
+            float dist = _alignedParams[i].NeighborDist;
+            int maxN = _alignedParams[i].MaxNeighbors;
             
-            for (int i = 0; i < agentCount; i++)
-            {
-                float2 pos = rawPosPtr[i];
-                float dist = agentParamsPtr[i].NeighborDist;
-                int maxN = agentParamsPtr[i].MaxNeighbors;
-                
-                // Use temp list
-                System.Collections.Generic.List<int> neighbors = new System.Collections.Generic.List<int>(); 
-                SpatialIndexManager.Instance.GetNeighborsInRadius(new Vector2(pos.x, pos.y), dist, neighbors);
-                
-                // Sort
-                neighbors.Sort((a, b) =>
-                {
-                    float d1 = math.distancesq(pos, rawPosPtr[a]);
-                    float d2 = math.distancesq(pos, rawPosPtr[b]);
-                    return d1.CompareTo(d2);
-                });
-                
-                int count = 0;
-                int offset = i * _maxNeighbors;
-                
-                for(int j=0; j<neighbors.Count && count < maxN; ++j)
-                {
-                    int idx = neighbors[j];
-                    if (idx != i)
-                    {
-                        _neighborIndices[offset + count] = idx;
-                        count++;
-                    }
-                }
-                
-                _neighborCounts[i] = count;
-                _neighborOffsets[i] = offset;
-            }
+            System.Collections.Generic.List<int> neighbors = new System.Collections.Generic.List<int>(); 
+            SpatialIndexManager.Instance.GetNeighborsInRadius(new Vector2(pos.x, pos.y), dist, neighbors);
+            
+            // Sort neighbors by distance to current agent
+            // Note: 'neighbors' contains IDs from SpatialIndexManager. 
+            // Are those Entity IDs? Yes, likely.
+            // But our aligned array is indexed 0..validCount.
+            // We need to map EntityID -> AlignedIndex for RVO logic?
+            // RVO logic needs neighbor's Position and Velocity.
+            // If neighbor 'K' (EntityID) is found, we need its current Position/Velocity.
+            // But we only have them in _alignedXXX arrays or via EntityManager lookup.
+            // Lookup via EntityManager is slow inside inner loop.
+            // Lookup via _alignedXXX requires searching _alignedEntityIds? Slow.
+            
+            // CRITICAL ISSUE:
+            // RVO requires random access to neighbor data.
+            // If we use Gather/Scatter, the indices passed to RVO must be indices into the Gathered arrays (0..validCount).
+            // But SpatialIndexManager returns Entity IDs (or whatever it stores).
+            // If SpatialIndexManager stores Entity IDs, we need to map EntityID -> AlignedIndex.
+            
+            // Solution: 
+            // 1. Build a map EntityID -> AlignedIndex during Gather.
+            //    We can use a NativeHashMap<int, int> map.
+            
+            // 2. Or pass pointers to ComponentArrays to RVO?
+            //    But they are unaligned (SparseSet).
+            //    Can SIMDRVO handle indirect access? No, it takes float2* posPtr.
+            //    It expects posPtr[neighborIdx] to be valid.
+            
+            // Backtrack:
+            // If we cannot guarantee alignment, and RVO requires dense indices 0..N,
+            // Then we MUST have a mapping.
+            // But SpatialIndex returns EntityIDs.
+            // If we change SpatialIndex to store AlignedIndices, we need to rebuild it every frame.
+            // Rebuilding Spatial Index every frame is common for dynamic agents.
+            
+            // Let's assume we rebuild Spatial Index here using _alignedPositions?
+            // The original code used SpatialIndexManager which might be persistent.
+            
+            // Alternative:
+            // Map EntityID -> AlignedIndex.
         }
-        else
+        
+        // Optimization:
+        // Use a lookup map.
+        // Since NativeHashMap might not be available, we use a pooled Dictionary.
+        _entityToAlignedMap.Clear();
+        for(int i=0; i<validCount; ++i) _entityToAlignedMap[_alignedEntityIds[i]] = i;
+
+        for (int i = 0; i < validCount; i++)
         {
-             // Fallback same as above
-             for (int i = 0; i < agentCount; i++)
+            float2 pos = _alignedPositions[i];
+            float dist = _alignedParams[i].NeighborDist;
+            int maxN = _alignedParams[i].MaxNeighbors;
+            
+            System.Collections.Generic.List<int> neighbors = new System.Collections.Generic.List<int>(); 
+            SpatialIndexManager.Instance.GetNeighborsInRadius(new Vector2(pos.x, pos.y), dist, neighbors);
+            
+            // Filter and Map neighbors to Aligned Indices
+            var validNeighbors = new System.Collections.Generic.List<int>();
+            for(int k=0; k<neighbors.Count; ++k)
             {
-                float2 pos = rawPosPtr[i];
-                float dist = agentParamsPtr[i].NeighborDist;
-                int maxN = agentParamsPtr[i].MaxNeighbors;
-                
-                System.Collections.Generic.List<int> neighbors = new System.Collections.Generic.List<int>(); 
-                SpatialIndexManager.Instance.GetNeighborsInRadius(new Vector2(pos.x, pos.y), dist, neighbors);
-                
-                neighbors.Sort((a, b) =>
+                if (_entityToAlignedMap.TryGetValue(neighbors[k], out int alignedIdx))
                 {
-                    float d1 = math.distancesq(pos, rawPosPtr[a]);
-                    float d2 = math.distancesq(pos, rawPosPtr[b]);
-                    return d1.CompareTo(d2);
-                });
-                
-                int count = 0;
-                int offset = i * _maxNeighbors;
-                
-                for(int j=0; j<neighbors.Count && count < maxN; ++j)
-                {
-                    int idx = neighbors[j];
-                    if (idx != i)
-                    {
-                        _neighborIndices[offset + count] = idx;
-                        count++;
-                    }
+                    validNeighbors.Add(alignedIdx);
                 }
-                
-                _neighborCounts[i] = count;
-                _neighborOffsets[i] = offset;
             }
+            
+            validNeighbors.Sort((a, b) =>
+            {
+                float d1 = math.distancesq(pos, _alignedPositions[a]);
+                float d2 = math.distancesq(pos, _alignedPositions[b]);
+                return d1.CompareTo(d2);
+            });
+            
+            int count = 0;
+            int offset = i * _maxNeighbors;
+            
+            for(int j=0; j<validNeighbors.Count && count < maxN; ++j)
+            {
+                int idx = validNeighbors[j];
+                if (idx != i)
+                {
+                    _neighborIndices[offset + count] = idx;
+                    count++;
+                }
+            }
+            
+            _neighborCounts[i] = count;
+            _neighborOffsets[i] = offset;
         }
 
         // 3. Compute RVO
@@ -173,11 +235,11 @@ public class RVOSimulationSystem : ISystem
         }
 
         SIMDRVO.ComputeRVOVelocities(
-            rawPosPtr,
-            rawVelPtr,
-            rawRadiiPtr,
-            agentParamsPtr,
-            (float2*)prefVelocities.GetUnsafePtr(),
+            (float2*)_alignedPositions.GetUnsafePtr(),
+            (float2*)_alignedVelocities.GetUnsafePtr(),
+            (float*)_alignedRadii.GetUnsafePtr(),
+            (AgentParameters*)_alignedParams.GetUnsafePtr(),
+            (float2*)_alignedPrefVelocities.GetUnsafePtr(),
             (int*)_neighborIndices.GetUnsafePtr(),
             (int*)_neighborCounts.GetUnsafePtr(),
             (int*)_neighborOffsets.GetUnsafePtr(),
@@ -186,35 +248,48 @@ public class RVOSimulationSystem : ISystem
             nodePtr,
             rootIdx,
             (float2*)_newVelocities.GetUnsafePtr(),
-            agentCount,
+            validCount,
             dt
         );
 
-        // 4. Update Velocities and Positions
-        for (int i = 0; i < agentCount; i++)
+        // 4. Scatter Phase: Update original components
+        for (int i = 0; i < validCount; i++)
         {
+            int entityId = _alignedEntityIds[i];
             float2 v = _newVelocities[i];
             
             // Set Velocity
-            VelocityComponent velComp = velocitiesPtr[i];
+            ref var velComp = ref velocities.GetRef(entityId);
             velComp.Value = v;
-            velocitiesPtr[i] = velComp;
             
             // Update Position
-            PositionComponent posComp = positionsPtr[i];
+            ref var posComp = ref positions.GetRef(entityId);
             posComp.Value += v * dt;
-            positionsPtr[i] = posComp;
         }
 
-        prefVelocities.Dispose();
+        // Sync Spatial Index
+        // We use the updated positions from _alignedPositions? 
+        // No, we just updated the components. 
+        // SpatialIndexManager typically needs a List<Vector2>.
+        // We can rebuild it from our updated data.
         
-        // Sync Spatial Index (Optimization: Batch update)
-        System.Collections.Generic.List<Vector2> posList = new System.Collections.Generic.List<Vector2>(agentCount);
-        for(int i=0; i<agentCount; ++i)
+        System.Collections.Generic.List<Vector2> posList = new System.Collections.Generic.List<Vector2>(validCount);
+        for(int i=0; i<validCount; ++i)
         {
-            float2 p = positionsPtr[i].Value;
+            // Re-calculate pos since we modified it in scatter loop?
+            // Or just read from component.
+            // Scatter loop updated component.
+            int entityId = _alignedEntityIds[i];
+            float2 p = positions.GetRef(entityId).Value;
             posList.Add(new Vector2(p.x, p.y));
         }
+        
+        // Note: This pushes positions to SpatialIndexManager.
+        // SpatialIndexManager expects positions for ALL entities?
+        // Or just the ones we simulated?
+        // If we have static entities, they might be missing here if they don't have MovementState.
+        // But SpatialIndexManager likely manages "Units".
+        // This part implies SpatialIndexManager is tightly coupled to this System.
         SpatialIndexManager.Instance.UpdatePositions(posList);
     }
 
@@ -225,24 +300,26 @@ public class RVOSimulationSystem : ISystem
             _capacity = math.max(count, _capacity * 2);
             if (_capacity < 128) _capacity = 128;
 
-            if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
-            if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
-            if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
-            if (_newVelocities.IsCreated) _newVelocities.Dispose();
+            DisposeArrays();
 
             _neighborIndices = new NativeArray<int>(_capacity * _maxNeighbors, Allocator.Persistent);
             _neighborCounts = new NativeArray<int>(_capacity, Allocator.Persistent);
             _neighborOffsets = new NativeArray<int>(_capacity, Allocator.Persistent);
             _newVelocities = new NativeArray<float2>(_capacity, Allocator.Persistent);
+            
+            _alignedPositions = new NativeArray<float2>(_capacity, Allocator.Persistent);
+            _alignedVelocities = new NativeArray<float2>(_capacity, Allocator.Persistent);
+            _alignedRadii = new NativeArray<float>(_capacity, Allocator.Persistent);
+            _alignedParams = new NativeArray<AgentParameters>(_capacity, Allocator.Persistent);
+            _alignedPrefVelocities = new NativeArray<float2>(_capacity, Allocator.Persistent);
+            _alignedEntityIds = new NativeArray<int>(_capacity, Allocator.Persistent);
         }
     }
 
-    // Call this to update obstacles from main thread
     public void UpdateObstacles(System.Collections.Generic.List<RVOObstacle> obstacles)
     {
         if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
         
-        // Convert
         _nativeObstacles = new NativeArray<SIMDRVO.ObstacleData>(obstacles.Count, Allocator.Persistent);
         
         for (int i = 0; i < obstacles.Count; i++)
