@@ -17,7 +17,7 @@ using Unity.Collections.LowLevel.Unsafe;
 [BurstCompile]
 public static unsafe class SIMDRVO
 {
-    private const float RVO_EPSILON = 0.00001f;
+    public const float RVO_EPSILON = 0.00001f;
 
     public struct AgentData
     {
@@ -40,6 +40,14 @@ public static unsafe class SIMDRVO
         public int NextObstacleIdx; // Index in the NativeArray (-1 if null)
         public int PrevObstacleIdx; // Index in the NativeArray (-1 if null)
         public bool IsConvex;
+    }
+
+    public struct ObstacleTreeNode
+    {
+        public int ObstacleIndex;
+        public int LeftNodeIndex;
+        public int RightNodeIndex;
+        public float MinX, MaxX, MinY, MaxY;
     }
 
     public static float det(float2 v1, float2 v2)
@@ -247,6 +255,8 @@ public static unsafe class SIMDRVO
         int* neighborOffsets,
         ObstacleData* obstacles,
         int obstacleCount,
+        ObstacleTreeNode* treeNodes,
+        int rootNodeIndex,
         float2* newVelocities,
         int agentCount,
         float timeStep)
@@ -255,15 +265,7 @@ public static unsafe class SIMDRVO
         const int MAX_OBSTACLES = 256; // Max obstacles per agent to process
 
         // Stack alloc buffers
-        // Note: stackalloc in loop is bad, but here we alloc once if possible?
-        // No, we are inside a function. Alloc is on stack.
-        // If we inline this, it's per thread.
-        // We can reuse these if we loop agents.
-        
-        // Buffers for sorting obstacles
         ObstacleDist* obstacleDists = stackalloc ObstacleDist[MAX_OBSTACLES];
-        
-        // ORCA lines buffer
         ORCALine* orcaLines = stackalloc ORCALine[MAX_LINES];
 
         for (int agentIdx = 0; agentIdx < agentCount; agentIdx++)
@@ -279,18 +281,33 @@ public static unsafe class SIMDRVO
             // ---------------------------------------------------------
             // 1. Process Obstacles
             // ---------------------------------------------------------
-            if (obstacleCount > 0)
+            int validObstacleCount = 0;
+
+            if (treeNodes != null && rootNodeIndex != -1)
             {
-                // Filter and Sort obstacles by distance
-                int validObstacleCount = 0;
-                
+                // Tree Query
+                // Note: RVO2 usually limits implicit query by TimeHorizonObst range.
+                // However, if TimeHorizonObst is large, we might get many obstacles.
+                // We use MAX_OBSTACLES to limit buffer.
+                float rangeSq = (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius); 
+                rangeSq = rangeSq * rangeSq;
+
+                QueryObstacleTreeRecursive(
+                    agent,
+                    rangeSq,
+                    treeNodes,
+                    obstacles,
+                    rootNodeIndex,
+                    obstacleDists,
+                    ref validObstacleCount,
+                    MAX_OBSTACLES
+                );
+            }
+            else if (obstacleCount > 0)
+            {
+                // Linear Scan
                 for (int i = 0; i < obstacleCount; i++)
                 {
-                    // Basic range check using point-to-segment distance?
-                    // Or just add all? For 50 obstacles, adding all is fine.
-                    // But sorting is required for "Already Covered" logic.
-                    // Let's compute distance and sort.
-                    
                     float distSq = distSqPointLineSegment(obstacles[i].Point1, obstacles[i].Point2, agent.Position);
                     
                     if (validObstacleCount < MAX_OBSTACLES)
@@ -300,7 +317,7 @@ public static unsafe class SIMDRVO
                     }
                 }
 
-                // Sort obstacles (Insertion Sort for small arrays is fast and cache friendly)
+                // Sort obstacles (Insertion Sort)
                 for (int i = 1; i < validObstacleCount; i++)
                 {
                     ObstacleDist key = obstacleDists[i];
@@ -312,7 +329,10 @@ public static unsafe class SIMDRVO
                     }
                     obstacleDists[j + 1] = key;
                 }
+            }
 
+            if (validObstacleCount > 0)
+            {
                 // Construct Lines
                 for (int i = 0; i < validObstacleCount; i++)
                 {
@@ -632,6 +652,77 @@ public static unsafe class SIMDRVO
             }
 
             newVelocities[agentIdx] = newVel;
+        }
+    }
+
+    private static void QueryObstacleTreeRecursive(
+        AgentData agent,
+        float rangeSq,
+        ObstacleTreeNode* treeNodes,
+        ObstacleData* treeObstacles,
+        int nodeIdx,
+        ObstacleDist* results,
+        ref int resultCount,
+        int maxResults)
+    {
+        if (nodeIdx == -1) return;
+
+        ObstacleTreeNode node = treeNodes[nodeIdx];
+        ObstacleData obstacle1 = treeObstacles[node.ObstacleIndex];
+
+        float2 p1 = obstacle1.Point1;
+        float2 p2 = obstacle1.Point2;
+
+        float agentLeftOfLine = det(p2 - p1, agent.Position - p1);
+
+        QueryObstacleTreeRecursive(agent, rangeSq, treeNodes, treeObstacles,
+            agentLeftOfLine >= 0.0f ? node.LeftNodeIndex : node.RightNodeIndex,
+            results, ref resultCount, maxResults);
+
+        float distSqLine = (agentLeftOfLine * agentLeftOfLine) / absSq(p2 - p1);
+
+        if (distSqLine < rangeSq)
+        {
+            if (agentLeftOfLine < 0.0f)
+            {
+                // Insert maintaining sort
+                float distSq = distSqPointLineSegment(p1, p2, agent.Position);
+                InsertObstacleNeighbor(node.ObstacleIndex, distSq, results, ref resultCount, maxResults);
+            }
+
+            QueryObstacleTreeRecursive(agent, rangeSq, treeNodes, treeObstacles,
+                agentLeftOfLine >= 0.0f ? node.RightNodeIndex : node.LeftNodeIndex,
+                results, ref resultCount, maxResults);
+        }
+    }
+
+    private static void InsertObstacleNeighbor(int index, float distSq, ObstacleDist* results, ref int count, int maxResults)
+    {
+        if (count < maxResults)
+        {
+            results[count] = new ObstacleDist { Index = index, DistSq = distSq };
+            count++;
+        }
+        else
+        {
+            // If full, check if new one is closer than furthest?
+            // Since we want CLOSEST neighbors, and we might discard far ones.
+            // obstacleDists array should keep closest.
+            // But usually we just take first N.
+            // If we have sort logic, we should replace the worst one if better.
+            if (distSq >= results[count - 1].DistSq) return;
+            
+            results[count - 1] = new ObstacleDist { Index = index, DistSq = distSq };
+        }
+
+        // Bubbling up to keep sorted
+        int i = count - 1;
+        while (i > 0 && results[i - 1].DistSq > results[i].DistSq)
+        {
+            ObstacleDist temp = results[i];
+            results[i] = results[i - 1];
+            results[i - 1] = temp;
+            i--;
         }
     }
 }

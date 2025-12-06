@@ -6,7 +6,7 @@ using Unity.Mathematics;
 /// Simple linear scan spatial index for line segments.
 /// O(N) query time, useful for small obstacle counts or as a baseline.
 /// </summary>
-public class SegmentLinearIndex : ISegmentSpatialIndex
+public class DefaultSegmentLinearIndex : ISegmentSpatialIndex
 {
     private List<RVOObstacle> _obstacles;
 

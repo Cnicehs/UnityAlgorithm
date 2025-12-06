@@ -30,7 +30,7 @@ public class RVOSimulator
     private List<Vector2> _cachedPositions = new List<Vector2>();
     private bool _obstaclesDirty = false;
 
-    private ISegmentSpatialIndex _obstacleIndex = new SegmentKdTreeIndex();
+    private ISegmentSpatialIndex _obstacleIndex = new DefaultSegmentKdTreeIndex();
 
     private RVOSimulator()
     {

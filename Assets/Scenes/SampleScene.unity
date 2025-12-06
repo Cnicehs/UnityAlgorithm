@@ -317,8 +317,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1167852290}
-  - component: {fileID: 1167852292}
-  - component: {fileID: 1167852293}
+  - component: {fileID: 1167852291}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -341,22 +340,7 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1167852292
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1167852288}
-  m_Enabled: 0
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1b22642dcb2be45c19e35fb239613ae3, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  UnitCount: 100000
-  Iterations: 100
-  Radius: 10
---- !u!114 &1167852293
+--- !u!114 &1167852291
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -365,17 +349,20 @@ MonoBehaviour:
   m_GameObject: {fileID: 1167852288}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1e8589f4cbe674cf6902ffe26185db20, type: 3}
+  m_Script: {fileID: 11500000, guid: 76c0d8f8c583f478fbd76001aacea876, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
   UseSIMD: 1
-  AgentCount: 5000
-  WorldSize: 50
+  AgentCount: 0
+  MapSize: 50
+  AgentSpeed: 5
   AgentRadius: 0.5
-  AgentSpeed: 2
-  ShowDebugGizmos: 1
-  SpatialIndexType: 4
-  GridResolution: 10
+  SpawnCount: 200
+  ObstacleCount: 50
+  ObstacleSizeMin: {x: 2, y: 2}
+  ObstacleSizeMax: {x: 8, y: 8}
+  CellSize: 1
+  PathUpdateInterval: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

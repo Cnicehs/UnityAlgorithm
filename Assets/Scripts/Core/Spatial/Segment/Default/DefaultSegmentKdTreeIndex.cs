@@ -7,7 +7,7 @@ using Unity.Mathematics;
 /// KD-Tree based spatial index for line segments (RVO obstacles).
 /// Uses RVO2's segment-splitting algorithm for optimal partitioning.
 /// </summary>
-public class SegmentKdTreeIndex : ISegmentSpatialIndex
+public class DefaultSegmentKdTreeIndex : ISegmentSpatialIndex
 {
     private class ObstacleTreeNode
     {

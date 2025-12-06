@@ -33,11 +33,13 @@ public class SIMDRVOSimulator
 
     private NativeArray<SIMDRVO.ObstacleData> _nativeObstacles;
     private int _obstacleCount;
+    private SIMDSegmentKdTreeIndex _segmentSpatialIndex;
 
     private List<Vector2> _positionCache = new List<Vector2>();
 
     private SIMDRVOSimulator()
     {
+        _segmentSpatialIndex = new SIMDSegmentKdTreeIndex();
     }
 
     public void Initialize(int count)
@@ -105,6 +107,7 @@ public class SIMDRVOSimulator
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
         if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
+        _segmentSpatialIndex?.Dispose();
     }
 
     public void Shutdown()
@@ -194,6 +197,9 @@ public class SIMDRVOSimulator
 
             _nativeObstacles[i] = dest;
         }
+
+        // 3. Build Spatial Index
+        _segmentSpatialIndex.Build(_nativeObstacles);
     }
 
     private List<int> _tempNeighbors = new List<int>();
@@ -265,13 +271,42 @@ public class SIMDRVOSimulator
             // 2. Compute RVO velocities using Burst (Single-threaded, SIMD-accelerated)
             using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.Compute"))
             {
+                SIMDRVO.ObstacleData* obstPtr = null;
+                int obstCount = 0;
+                SIMDRVO.ObstacleTreeNode* nodePtr = null;
+                int rootIdx = -1;
+
+                if (_nativeObstacles.IsCreated)
+                {
+                    // Use Tree Data if available (and built)
+                    // SIMDSegmentKdTreeIndex builds _treeObstacles which might be larger than _nativeObstacles due to splits
+                    var treeObs = _segmentSpatialIndex.GetTreeObstacles();
+                    var treeNodes = _segmentSpatialIndex.GetTreeNodes();
+                    
+                    if (treeObs.IsCreated && treeNodes.IsCreated)
+                    {
+                        obstPtr = (SIMDRVO.ObstacleData*)treeObs.GetUnsafePtr();
+                        obstCount = _segmentSpatialIndex.GetTreeObstacleCount();
+                        nodePtr = (SIMDRVO.ObstacleTreeNode*)treeNodes.GetUnsafePtr();
+                        rootIdx = _segmentSpatialIndex.GetRootNodeIndex();
+                    }
+                    else
+                    {
+                        // Fallback to linear if tree not built (shouldn't happen if UpdateObstacles called)
+                        obstPtr = (SIMDRVO.ObstacleData*)_nativeObstacles.GetUnsafePtr();
+                        obstCount = _obstacleCount;
+                    }
+                }
+
                 SIMDRVO.ComputeRVOVelocities(
                     (SIMDRVO.AgentData*)_agents.GetUnsafePtr(),
                     (int*)_neighborIndices.GetUnsafePtr(),
                     (int*)_neighborCounts.GetUnsafePtr(),
                     (int*)_neighborOffsets.GetUnsafePtr(),
-                    (SIMDRVO.ObstacleData*)(_nativeObstacles.IsCreated ? _nativeObstacles.GetUnsafePtr() : null),
-                    _nativeObstacles.IsCreated ? _obstacleCount : 0,
+                    obstPtr,
+                    obstCount,
+                    nodePtr,
+                    rootIdx,
                     (float2*)_newVelocities.GetUnsafePtr(),
                     _agentCount,
                     dt
