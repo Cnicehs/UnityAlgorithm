@@ -27,6 +27,7 @@ public static class SystemBootstrapper
                     var system = (ISystem)Activator.CreateInstance(type);
                     system.Initialize();
                     systems.Add(system);
+                    EntityManager.Instance.RegisterSystem(system);
                 }
                 catch (Exception e)
                 {

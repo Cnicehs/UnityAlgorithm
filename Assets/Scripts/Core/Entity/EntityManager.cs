@@ -13,6 +13,9 @@ public class EntityManager
 
     // Component Storage (Generic)
     private Dictionary<Type, INativeComponentArray> _componentArrays = new Dictionary<Type, INativeComponentArray>();
+    
+    // System Storage
+    private Dictionary<Type, object> _systems = new Dictionary<Type, object>();
 
     public int Count => _activeEntityIds.Count;
 
@@ -102,7 +105,25 @@ public class EntityManager
             array.Dispose();
         }
         _componentArrays.Clear();
+        _systems.Clear();
         _activeEntityIds.Clear();
         _instance = null;
+    }
+
+    public void RegisterSystem(ISystem system)
+    {
+        if (system != null)
+        {
+            _systems[system.GetType()] = system;
+        }
+    }
+
+    public T GetSystem<T>() where T : class
+    {
+        if (_systems.TryGetValue(typeof(T), out var system))
+        {
+            return system as T;
+        }
+        return null;
     }
 }

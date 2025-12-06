@@ -151,18 +151,13 @@ public class RVOSimulator
 
     public void ProcessObstacles()
     {
-        // Link obstacles together in a chain
-        // This is important for the leg-based velocity obstacle calculations
         // Link obstacles together in a chain based on geometric connectivity
         // This handles multiple disjoint polygons and out-of-order addition
         float toleranceSq = 0.0001f;
 
-        Debug.Log("=== ProcessObstacles Start ===");
         for (int i = 0; i < _obstacles.Count; i++)
         {
             RVOObstacle current = _obstacles[i];
-
-            Debug.Log($"Edge{i}: {current.Point1} → {current.Point2}, Dir: {current.Direction}");
 
             // Find NextObstacle: starts where current ends
             current.NextObstacle = null;
@@ -172,7 +167,6 @@ public class RVOSimulator
                 if (math.distancesq(current.Point2, _obstacles[j].Point1) < toleranceSq)
                 {
                     current.NextObstacle = _obstacles[j];
-                    Debug.Log($"  Next = Edge{j}");
                     break;
                 }
             }
@@ -185,7 +179,6 @@ public class RVOSimulator
                 if (math.distancesq(_obstacles[j].Point2, current.Point1) < toleranceSq)
                 {
                     current.PrevObstacle = _obstacles[j];
-                    Debug.Log($"  Prev = Edge{j}");
                     break;
                 }
             }
@@ -198,16 +191,13 @@ public class RVOSimulator
                 float2 nextDir = current.NextObstacle.Direction;
                 float detValue = RVOMath.det(current.Direction, nextDir);
                 current.IsConvex = detValue >= 0.0f;
-                Debug.Log($"  IsConvex = {current.IsConvex} (det={detValue})");
             }
             else
             {
                 // If no next obstacle (e.g. open chain), assume convex
                 current.IsConvex = true;
-                Debug.Log($"  IsConvex = true (no next)");
             }
         }
-        Debug.Log("=== ProcessObstacles End ===");
 
         // Rebuild Spatial Index
         _obstacleIndex.Build(_obstacles);

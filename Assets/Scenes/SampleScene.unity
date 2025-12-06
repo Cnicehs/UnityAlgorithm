@@ -318,6 +318,9 @@ GameObject:
   m_Component:
   - component: {fileID: 1167852290}
   - component: {fileID: 1167852291}
+  - component: {fileID: 1167852292}
+  - component: {fileID: 1167852293}
+  - component: {fileID: 1167852294}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -347,22 +350,79 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1167852288}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 76c0d8f8c583f478fbd76001aacea876, type: 3}
+  m_Script: {fileID: 11500000, guid: 37e117b538c504724a23dafc144912dd, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  UseSIMD: 1
-  AgentCount: 0
-  MapSize: 50
+  CurrentMode: 3
+  CurrentAlgorithm: 1
+  Width: 50
+  Height: 50
+  CellSize: 1
+  ObstacleCount: 20
+  ObstacleSizeMin: {x: 2, y: 2}
+  ObstacleSizeMax: {x: 5, y: 5}
+  AgentCount: 100
   AgentSpeed: 5
   AgentRadius: 0.5
-  SpawnCount: 200
-  ObstacleCount: 50
-  ObstacleSizeMin: {x: 2, y: 2}
-  ObstacleSizeMax: {x: 8, y: 8}
-  CellSize: 1
-  PathUpdateInterval: 1
+--- !u!114 &1167852292
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1167852288}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d02d135f7e46040dfa79fa3541cb7c2f, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  AgentCount: 10
+  SpawnRadius: 5
+  TargetDistance: 20
+  AgentSpeed: 5
+  AgentRadius: 0.5
+  TimeHorizonObst: 0.5
+--- !u!114 &1167852293
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1167852288}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 550534d10aef54b83a2bcc701930201b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  AgentCount: 100
+  TimeStep: 0.1
+  SpawnRadius: 23.25
+  MaxSpeed: 10
+  ShowAgents: 1
+  ShowVelocity: 1
+  ShowORCALines: 0
+  DebugAgentIndex: 0
+--- !u!114 &1167852294
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1167852288}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f35738b180a3e46b29f98cac76f69c4e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  AgentCount: 10
+  TimeStep: 0.25
+  SpawnRadius: 10
+  MaxSpeed: 0.2
+  ShowAgents: 1
+  ShowVelocity: 1
+  ShowObstacles: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

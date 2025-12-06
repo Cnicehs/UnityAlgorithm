@@ -42,14 +42,6 @@ public static unsafe class SIMDRVO
         public bool IsConvex;
     }
 
-    public struct ObstacleTreeNode
-    {
-        public int ObstacleIndex;
-        public int LeftNodeIndex;
-        public int RightNodeIndex;
-        public float MinX, MaxX, MinY, MaxY;
-    }
-
     public static float det(float2 v1, float2 v2)
     {
         return v1.x * v2.y - v1.y * v2.x;
@@ -188,13 +180,6 @@ public static unsafe class SIMDRVO
         {
             if (det(lines[i].Direction, lines[i].Point - result) > distance)
             {
-                // We need a temporary list of lines for the recursive call.
-                // Since we are in Burst/Unsafe, we can stackalloc or use a pre-allocated buffer.
-                // However, linearProgram2 expects a pointer to ORCALines.
-                // We can copy the relevant lines to a temporary buffer.
-                // Max lines is usually small (MaxNeighbors + Obstacles).
-                // Let's assume a max limit for stack allocation.
-                
                 const int MAX_LINES = 128; // Should be enough for neighbors
                 ORCALine* projLines = stackalloc ORCALine[MAX_LINES];
                 int projLineCount = 0;
@@ -247,16 +232,350 @@ public static unsafe class SIMDRVO
         public int CompareTo(ObstacleDist other) => DistSq.CompareTo(other.DistSq);
     }
 
+    // Core RVO Logic for a single agent
+    private static void ComputeSingleAgentVelocity(
+        in AgentData agent,
+        int* neighborIndices,
+        int neighborCount,
+        int neighborOffset,
+        int* obstacleNeighborIndices,
+        int obstacleNeighborCount,
+        int obstacleNeighborOffset,
+        ObstacleData* obstacles,
+        float timeStep,
+        ORCALine* orcaLines,
+        ObstacleDist* obstacleDists,
+        ref float2 newVelocity,
+        // Neighbor Data Accessors
+        void* agentListPtr, // AgentData* or null
+        float2* positionsPtr, // null if AoS
+        float2* velocitiesPtr, // null if AoS
+        float* radiiPtr // null if AoS
+    )
+    {
+        // 1. Process Obstacles
+        int lineCount = 0;
+        int validObstacleCount = 0;
+        float invTimeHorizonObst = 1.0f / agent.TimeHorizonObst;
+        const int MAX_OBSTACLES = 256;
+        const int MAX_LINES = 512;
+
+        // Use pre-computed neighbor obstacles
+        if (obstacleNeighborCount > 0)
+        {
+            float rangeSq = (agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius); 
+            rangeSq = rangeSq * rangeSq;
+
+            for (int i = 0; i < obstacleNeighborCount; i++)
+            {
+                int obstacleIdx = obstacleNeighborIndices[obstacleNeighborOffset + i];
+                // Safety check
+                // if (obstacleIdx < 0) continue; // Assume valid indices from caller
+
+                float distSq = distSqPointLineSegment(obstacles[obstacleIdx].Point1, obstacles[obstacleIdx].Point2, agent.Position);
+                if (distSq < rangeSq)
+                {
+                    InsertObstacleNeighbor(obstacleIdx, distSq, obstacleDists, ref validObstacleCount, MAX_OBSTACLES);
+                }
+            }
+        }
+
+        if (validObstacleCount > 0)
+        {
+            for (int i = 0; i < validObstacleCount; i++)
+            {
+                int obstIdx = obstacleDists[i].Index;
+                ObstacleData obstacle1 = obstacles[obstIdx];
+                
+                bool alreadyCovered = false;
+                for (int j = 0; j < lineCount; ++j)
+                {
+                    if (det(invTimeHorizonObst * (obstacle1.Point1 - agent.Position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON &&
+                        det(invTimeHorizonObst * (obstacle1.Point2 - agent.Position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * agent.Radius >= -RVO_EPSILON)
+                    {
+                        alreadyCovered = true;
+                        break;
+                    }
+                }
+                if (alreadyCovered) continue;
+
+                float2 relativePosition1 = obstacle1.Point1 - agent.Position;
+                float2 relativePosition2 = obstacle1.Point2 - agent.Position;
+                
+                float distSq1 = absSq(relativePosition1);
+                float distSq2 = absSq(relativePosition2);
+                float radiusSq = agent.Radius * agent.Radius;
+
+                float2 obstacleVec = obstacle1.Point2 - obstacle1.Point1;
+                float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
+                float distSqLine = absSq(-relativePosition1 - s * obstacleVec);
+
+                ORCALine line = default;
+                bool lineAdded = false;
+
+                if (s < 0.0f && distSq1 <= radiusSq)
+                {
+                    if (obstacle1.IsConvex)
+                    {
+                        line.Point = new float2(0.0f, 0.0f);
+                        line.Direction = normalize(new float2(-relativePosition1.y, relativePosition1.x));
+                        lineAdded = true;
+                    }
+                }
+                else if (s > 1.0f && distSq2 <= radiusSq)
+                {
+                    bool nextIsConvex = true;
+                    if (obstacle1.NextObstacleIdx != -1)
+                    {
+                        ObstacleData nextObs = obstacles[obstacle1.NextObstacleIdx];
+                        nextIsConvex = nextObs.IsConvex;
+                    }
+
+                    if (nextIsConvex)
+                    {
+                        line.Point = new float2(0.0f, 0.0f);
+                        line.Direction = normalize(new float2(-relativePosition2.y, relativePosition2.x));
+                        lineAdded = true;
+                    }
+                }
+                else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
+                {
+                    line.Point = new float2(0.0f, 0.0f);
+                    line.Direction = -obstacle1.Direction;
+                    lineAdded = true;
+                }
+                else
+                {
+                    float2 leftLegDirection, rightLegDirection;
+                    bool isLeftLegForeign = false;
+                    bool isRightLegForeign = false;
+
+                    if (s < 0.0f && distSqLine <= radiusSq)
+                    {
+                        if (!obstacle1.IsConvex) continue;
+                        obstacle1 = obstacles[obstIdx];
+                        float leg1 = math.sqrt(distSq1 - radiusSq);
+                        leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius, relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
+                        float leg2 = math.sqrt(distSq2 - radiusSq);
+                        rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * agent.Radius, -relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
+                    }
+                    else if (s > 1.0f && distSqLine <= radiusSq)
+                    {
+                         float leg1 = math.sqrt(distSq1 - radiusSq);
+                         leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius, relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
+                         float leg2 = math.sqrt(distSq2 - radiusSq);
+                         rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * agent.Radius, -relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
+                    }
+                    else
+                    {
+                        if (obstacle1.IsConvex)
+                        {
+                            float leg1 = math.sqrt(distSq1 - radiusSq);
+                            leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * agent.Radius, relativePosition1.x * agent.Radius + relativePosition1.y * leg1) / distSq1;
+                        }
+                        else leftLegDirection = -obstacle1.Direction;
+
+                        bool nextIsConvex = true;
+                        if (obstacle1.NextObstacleIdx != -1) nextIsConvex = obstacles[obstacle1.NextObstacleIdx].IsConvex;
+                        
+                        if (nextIsConvex)
+                        {
+                            float leg2 = math.sqrt(distSq2 - radiusSq);
+                            rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * agent.Radius, -relativePosition2.x * agent.Radius + relativePosition2.y * leg2) / distSq2;
+                        }
+                        else rightLegDirection = obstacle1.Direction;
+                    }
+
+                    ObstacleData leftNeighbor = default;
+                    bool hasLeft = obstacle1.PrevObstacleIdx != -1;
+                    if (hasLeft) leftNeighbor = obstacles[obstacle1.PrevObstacleIdx];
+
+                    if (obstacle1.IsConvex && hasLeft && det(leftLegDirection, -leftNeighbor.Direction) >= 0.0f)
+                    {
+                        leftLegDirection = -leftNeighbor.Direction;
+                        isLeftLegForeign = true;
+                    }
+
+                    ObstacleData rightNeighbor = default;
+                    bool hasRight = obstacle1.NextObstacleIdx != -1;
+                    if (hasRight) rightNeighbor = obstacles[obstacle1.NextObstacleIdx];
+
+                    if (hasRight && rightNeighbor.IsConvex && det(rightLegDirection, rightNeighbor.Direction) <= 0.0f)
+                    {
+                        rightLegDirection = rightNeighbor.Direction;
+                        isRightLegForeign = true;
+                    }
+
+                    float2 leftCutOff = invTimeHorizonObst * (obstacle1.Point1 - agent.Position);
+                    float2 rightCutOff = invTimeHorizonObst * (obstacle1.Point2 - agent.Position);
+                    float2 cutOffVector = rightCutOff - leftCutOff;
+
+                    float t = (obstacle1.Point1.Equals(obstacle1.Point2)) ? 0.5f : math.dot(agent.Velocity - leftCutOff, cutOffVector) / absSq(cutOffVector);
+                    float tLeft = math.dot(agent.Velocity - leftCutOff, leftLegDirection);
+                    float tRight = math.dot(agent.Velocity - rightCutOff, rightLegDirection);
+
+                    if ((t < 0.0f && tLeft < 0.0f) || (obstacle1.Point1.Equals(obstacle1.Point2) && tLeft < 0.0f && tRight < 0.0f))
+                    {
+                        float2 unitW = normalize(agent.Velocity - leftCutOff);
+                        line.Direction = new float2(unitW.y, -unitW.x);
+                        line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * unitW;
+                        lineAdded = true;
+                    }
+                    else if (t > 1.0f && tRight < 0.0f)
+                    {
+                        float2 unitW = normalize(agent.Velocity - rightCutOff);
+                        line.Direction = new float2(unitW.y, -unitW.x);
+                        line.Point = rightCutOff + agent.Radius * invTimeHorizonObst * unitW;
+                        lineAdded = true;
+                    }
+                    else if (t >= 0.0f && t <= 1.0f)
+                    {
+                         float distSqCutoff = absSq(agent.Velocity - (leftCutOff + t * cutOffVector));
+                         float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (leftCutOff + tLeft * leftLegDirection));
+                         float distSqRight = tRight < 0.0f ? float.PositiveInfinity : absSq(agent.Velocity - (rightCutOff + tRight * rightLegDirection));
+
+                         if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
+                         {
+                             line.Direction = -obstacle1.Direction;
+                             line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                             lineAdded = true;
+                         }
+                         else if (distSqLeft <= distSqRight)
+                         {
+                             if (!isLeftLegForeign)
+                             {
+                                 line.Direction = leftLegDirection;
+                                 line.Point = leftCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                                 lineAdded = true;
+                             }
+                         }
+                         else
+                         {
+                             if (!isRightLegForeign)
+                             {
+                                 line.Direction = rightLegDirection;
+                                 line.Point = rightCutOff + agent.Radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
+                                 lineAdded = true;
+                             }
+                         }
+                    }
+                }
+
+                if (lineAdded && lineCount < MAX_LINES)
+                {
+                    orcaLines[lineCount++] = line;
+                }
+            }
+        }
+
+        // 2. Process Agents
+        float invTimeHorizon = 1.0f / agent.TimeHorizon;
+
+        for (int i = 0; i < neighborCount; ++i)
+        {
+            int neighborIdx = neighborIndices[neighborOffset + i];
+            
+            float2 otherPos, otherVel;
+            float otherRadius;
+
+            if (agentListPtr != null)
+            {
+                AgentData* agentList = (AgentData*)agentListPtr;
+                AgentData other = agentList[neighborIdx];
+                otherPos = other.Position;
+                otherVel = other.Velocity;
+                otherRadius = other.Radius;
+            }
+            else
+            {
+                otherPos = positionsPtr[neighborIdx];
+                otherVel = velocitiesPtr[neighborIdx];
+                otherRadius = radiiPtr[neighborIdx];
+            }
+
+            float2 relativePosition = otherPos - agent.Position;
+            float2 relativeVelocity = agent.Velocity - otherVel;
+            float distSq = math.lengthsq(relativePosition);
+            float combinedRadius = agent.Radius + otherRadius;
+            float combinedRadiusSq = combinedRadius * combinedRadius;
+
+            ORCALine line;
+            float2 u;
+
+            if (distSq > combinedRadiusSq)
+            {
+                float2 w = relativeVelocity - invTimeHorizon * relativePosition;
+                float wLengthSq = math.lengthsq(w);
+                float dotProduct1 = math.dot(w, relativePosition);
+
+                if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
+                {
+                    float wLength = math.sqrt(wLengthSq);
+                    float2 unitW = w / wLength;
+
+                    line.Direction = new float2(unitW.y, -unitW.x);
+                    u = (combinedRadius * invTimeHorizon - wLength) * unitW;
+                }
+                else
+                {
+                    float leg = math.sqrt(distSq - combinedRadiusSq);
+                    if (det(relativePosition, w) > 0.0f)
+                    {
+                        line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, 
+                                                   relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
+                    }
+                    else
+                    {
+                        line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, 
+                                                    -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
+                    }
+
+                    float dotProduct2 = math.dot(relativeVelocity, line.Direction);
+                    u = dotProduct2 * line.Direction - relativeVelocity;
+                }
+            }
+            else
+            {
+                float invTimeStep = 1.0f / timeStep;
+                float2 w = relativeVelocity - invTimeStep * relativePosition;
+                float wLength = math.length(w);
+                float2 unitW = w / wLength;
+
+                line.Direction = new float2(unitW.y, -unitW.x);
+                u = (combinedRadius * invTimeStep - wLength) * unitW;
+            }
+
+            line.Point = agent.Velocity + 0.5f * u;
+            
+            if (lineCount < MAX_LINES)
+            {
+                orcaLines[lineCount++] = line;
+            }
+        }
+
+        // 3. Linear Programming
+        float2 newVel = float2.zero;
+        int lineFail = linearProgram2(orcaLines, lineCount, agent.MaxSpeed, agent.PrefVelocity, false, ref newVel);
+
+        if (lineFail < lineCount)
+        {
+            linearProgram3(orcaLines, lineCount, 0, lineFail, agent.MaxSpeed, ref newVel);
+        }
+
+        newVelocity = newVel;
+    }
+
     [BurstCompile]
     public static unsafe void ComputeRVOVelocities(
         AgentData* agents,
         int* neighborIndices,
         int* neighborCounts,
         int* neighborOffsets,
+        int* obstacleNeighborIndices,
+        int* obstacleNeighborCounts,
+        int* obstacleNeighborOffsets,
         ObstacleData* obstacles,
         int obstacleCount,
-        ObstacleTreeNode* treeNodes,
-        int rootNodeIndex,
         float2* newVelocities,
         int agentCount,
         float timeStep)
@@ -267,343 +586,27 @@ public static unsafe class SIMDRVO
         ObstacleDist* obstacleDists = stackalloc ObstacleDist[MAX_OBSTACLES];
         ORCALine* orcaLines = stackalloc ORCALine[MAX_LINES];
 
-        for (int agentIdx = 0; agentIdx < agentCount; agentIdx++)
+        for (int i = 0; i < agentCount; i++)
         {
-            AgentData agent = agents[agentIdx];
-            // Extract fields for compatibility with shared logic
-            float2 position = agent.Position;
-            float2 velocity = agent.Velocity;
-            float radius = agent.Radius;
-            float maxSpeed = agent.MaxSpeed;
-            float timeHorizon = agent.TimeHorizon;
-            float timeHorizonObst = agent.TimeHorizonObst;
-            float2 prefVelocity = agent.PrefVelocity;
-
-            int count = neighborCounts[agentIdx];
-            int offset = neighborOffsets[agentIdx];
-
-            int lineCount = 0;
-            
-            float invTimeHorizonObst = 1.0f / timeHorizonObst;
-
-            // 1. Process Obstacles
-            int validObstacleCount = 0;
-
-            if (treeNodes != null && rootNodeIndex != -1)
-            {
-                float rangeSq = (timeHorizonObst * maxSpeed + radius); 
-                rangeSq = rangeSq * rangeSq;
-
-                QueryObstacleTreeRecursive(
-                    position,
-                    rangeSq,
-                    treeNodes,
-                    obstacles,
-                    rootNodeIndex,
-                    obstacleDists,
-                    ref validObstacleCount,
-                    MAX_OBSTACLES
-                );
-            }
-            else if (obstacleCount > 0)
-            {
-                for (int i = 0; i < obstacleCount; i++)
-                {
-                    float distSq = distSqPointLineSegment(obstacles[i].Point1, obstacles[i].Point2, position);
-                    
-                    if (validObstacleCount < MAX_OBSTACLES)
-                    {
-                        obstacleDists[validObstacleCount] = new ObstacleDist { Index = i, DistSq = distSq };
-                        validObstacleCount++;
-                    }
-                }
-
-                for (int i = 1; i < validObstacleCount; i++)
-                {
-                    ObstacleDist key = obstacleDists[i];
-                    int j = i - 1;
-                    while (j >= 0 && obstacleDists[j].DistSq > key.DistSq)
-                    {
-                        obstacleDists[j + 1] = obstacleDists[j];
-                        j--;
-                    }
-                    obstacleDists[j + 1] = key;
-                }
-            }
-
-            if (validObstacleCount > 0)
-            {
-                for (int i = 0; i < validObstacleCount; i++)
-                {
-                    int obstIdx = obstacleDists[i].Index;
-                    ObstacleData obstacle1 = obstacles[obstIdx];
-                    
-                    bool alreadyCovered = false;
-                    for (int j = 0; j < lineCount; ++j)
-                    {
-                        if (det(invTimeHorizonObst * (obstacle1.Point1 - position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * radius >= -RVO_EPSILON &&
-                            det(invTimeHorizonObst * (obstacle1.Point2 - position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * radius >= -RVO_EPSILON)
-                        {
-                            alreadyCovered = true;
-                            break;
-                        }
-                    }
-                    if (alreadyCovered) continue;
-
-                    float2 relativePosition1 = obstacle1.Point1 - position;
-                    float2 relativePosition2 = obstacle1.Point2 - position;
-                    
-                    float distSq1 = absSq(relativePosition1);
-                    float distSq2 = absSq(relativePosition2);
-                    float radiusSq = radius * radius;
-
-                    float2 obstacleVec = obstacle1.Point2 - obstacle1.Point1;
-                    float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
-                    float distSqLine = absSq(-relativePosition1 - s * obstacleVec);
-
-                    ORCALine line = default;
-                    bool lineAdded = false;
-
-                    if (s < 0.0f && distSq1 <= radiusSq)
-                    {
-                        if (obstacle1.IsConvex)
-                        {
-                            line.Point = new float2(0.0f, 0.0f);
-                            line.Direction = normalize(new float2(-relativePosition1.y, relativePosition1.x));
-                            lineAdded = true;
-                        }
-                    }
-                    else if (s > 1.0f && distSq2 <= radiusSq)
-                    {
-                        bool nextIsConvex = true;
-                        if (obstacle1.NextObstacleIdx != -1)
-                        {
-                            ObstacleData nextObs = obstacles[obstacle1.NextObstacleIdx];
-                            nextIsConvex = nextObs.IsConvex;
-                        }
-
-                        if (nextIsConvex)
-                        {
-                            line.Point = new float2(0.0f, 0.0f);
-                            line.Direction = normalize(new float2(-relativePosition2.y, relativePosition2.x));
-                            lineAdded = true;
-                        }
-                    }
-                    else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
-                    {
-                        line.Point = new float2(0.0f, 0.0f);
-                        line.Direction = -obstacle1.Direction;
-                        lineAdded = true;
-                    }
-                    else
-                    {
-                        float2 leftLegDirection, rightLegDirection;
-                        bool isLeftLegForeign = false;
-                        bool isRightLegForeign = false;
-
-                        if (s < 0.0f && distSqLine <= radiusSq)
-                        {
-                            if (!obstacle1.IsConvex) continue;
-                            
-                            obstacle1 = obstacles[obstIdx];
-                            
-                            float leg1 = math.sqrt(distSq1 - radiusSq);
-                            leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                            
-                            float leg2 = math.sqrt(distSq2 - radiusSq);
-                            rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                        }
-                        else if (s > 1.0f && distSqLine <= radiusSq)
-                        {
-                             float leg1 = math.sqrt(distSq1 - radiusSq);
-                             leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                             float leg2 = math.sqrt(distSq2 - radiusSq);
-                             rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                        }
-                        else
-                        {
-                            if (obstacle1.IsConvex)
-                            {
-                                float leg1 = math.sqrt(distSq1 - radiusSq);
-                                leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                            }
-                            else leftLegDirection = -obstacle1.Direction;
-
-                            bool nextIsConvex = true;
-                            if (obstacle1.NextObstacleIdx != -1) nextIsConvex = obstacles[obstacle1.NextObstacleIdx].IsConvex;
-                            
-                            if (nextIsConvex)
-                            {
-                                float leg2 = math.sqrt(distSq2 - radiusSq);
-                                rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                            }
-                            else rightLegDirection = obstacle1.Direction;
-                        }
-
-                        ObstacleData leftNeighbor = default;
-                        bool hasLeft = obstacle1.PrevObstacleIdx != -1;
-                        if (hasLeft) leftNeighbor = obstacles[obstacle1.PrevObstacleIdx];
-
-                        if (obstacle1.IsConvex && hasLeft && det(leftLegDirection, -leftNeighbor.Direction) >= 0.0f)
-                        {
-                            leftLegDirection = -leftNeighbor.Direction;
-                            isLeftLegForeign = true;
-                        }
-
-                        ObstacleData rightNeighbor = default;
-                        bool hasRight = obstacle1.NextObstacleIdx != -1;
-                        if (hasRight) rightNeighbor = obstacles[obstacle1.NextObstacleIdx];
-
-                        if (hasRight && rightNeighbor.IsConvex && det(rightLegDirection, rightNeighbor.Direction) <= 0.0f)
-                        {
-                            rightLegDirection = rightNeighbor.Direction;
-                            isRightLegForeign = true;
-                        }
-
-                        float2 leftCutOff = invTimeHorizonObst * (obstacle1.Point1 - position);
-                        float2 rightCutOff = invTimeHorizonObst * (obstacle1.Point2 - position);
-                        float2 cutOffVector = rightCutOff - leftCutOff;
-
-                        float t = (obstacle1.Point1.Equals(obstacle1.Point2)) ? 0.5f : math.dot(velocity - leftCutOff, cutOffVector) / absSq(cutOffVector);
-                        float tLeft = math.dot(velocity - leftCutOff, leftLegDirection);
-                        float tRight = math.dot(velocity - rightCutOff, rightLegDirection);
-
-                        if ((t < 0.0f && tLeft < 0.0f) || (obstacle1.Point1.Equals(obstacle1.Point2) && tLeft < 0.0f && tRight < 0.0f))
-                        {
-                            float2 unitW = normalize(velocity - leftCutOff);
-                            line.Direction = new float2(unitW.y, -unitW.x);
-                            line.Point = leftCutOff + radius * invTimeHorizonObst * unitW;
-                            lineAdded = true;
-                        }
-                        else if (t > 1.0f && tRight < 0.0f)
-                        {
-                            float2 unitW = normalize(velocity - rightCutOff);
-                            line.Direction = new float2(unitW.y, -unitW.x);
-                            line.Point = rightCutOff + radius * invTimeHorizonObst * unitW;
-                            lineAdded = true;
-                        }
-                        else if (t >= 0.0f && t <= 1.0f)
-                        {
-                             float distSqCutoff = absSq(velocity - (leftCutOff + t * cutOffVector));
-                             float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : absSq(velocity - (leftCutOff + tLeft * leftLegDirection));
-                             float distSqRight = tRight < 0.0f ? float.PositiveInfinity : absSq(velocity - (rightCutOff + tRight * rightLegDirection));
-
-                             if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
-                             {
-                                 line.Direction = -obstacle1.Direction;
-                                 line.Point = leftCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                 lineAdded = true;
-                             }
-                             else if (distSqLeft <= distSqRight)
-                             {
-                                 if (!isLeftLegForeign)
-                                 {
-                                     line.Direction = leftLegDirection;
-                                     line.Point = leftCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                     lineAdded = true;
-                                 }
-                             }
-                             else
-                             {
-                                 if (!isRightLegForeign)
-                                 {
-                                     line.Direction = rightLegDirection;
-                                     line.Point = rightCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                     lineAdded = true;
-                                 }
-                             }
-                        }
-                    }
-
-                    if (lineAdded && lineCount < MAX_LINES)
-                    {
-                        orcaLines[lineCount++] = line;
-                    }
-                }
-            }
-
-            // 2. Process Agents
-            float invTimeHorizon = 1.0f / timeHorizon;
-
-            for (int i = 0; i < count; ++i)
-            {
-                int neighborIdx = neighborIndices[offset + i];
-                // Access neighbors from AoS
-                AgentData other = agents[neighborIdx];
-                
-                float2 otherPos = other.Position;
-                float2 otherVel = other.Velocity;
-                float otherRadius = other.Radius;
-
-                float2 relativePosition = otherPos - position;
-                float2 relativeVelocity = velocity - otherVel;
-                float distSq = math.lengthsq(relativePosition);
-                float combinedRadius = radius + otherRadius;
-                float combinedRadiusSq = combinedRadius * combinedRadius;
-
-                ORCALine line;
-                float2 u;
-
-                if (distSq > combinedRadiusSq)
-                {
-                    float2 w = relativeVelocity - invTimeHorizon * relativePosition;
-                    float wLengthSq = math.lengthsq(w);
-                    float dotProduct1 = math.dot(w, relativePosition);
-
-                    if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
-                    {
-                        float wLength = math.sqrt(wLengthSq);
-                        float2 unitW = w / wLength;
-
-                        line.Direction = new float2(unitW.y, -unitW.x);
-                        u = (combinedRadius * invTimeHorizon - wLength) * unitW;
-                    }
-                    else
-                    {
-                        float leg = math.sqrt(distSq - combinedRadiusSq);
-                        if (det(relativePosition, w) > 0.0f)
-                        {
-                            line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, 
-                                                       relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                        }
-                        else
-                        {
-                            line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, 
-                                                        -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                        }
-
-                        float dotProduct2 = math.dot(relativeVelocity, line.Direction);
-                        u = dotProduct2 * line.Direction - relativeVelocity;
-                    }
-                }
-                else
-                {
-                    float invTimeStep = 1.0f / timeStep;
-                    float2 w = relativeVelocity - invTimeStep * relativePosition;
-                    float wLength = math.length(w);
-                    float2 unitW = w / wLength;
-
-                    line.Direction = new float2(unitW.y, -unitW.x);
-                    u = (combinedRadius * invTimeStep - wLength) * unitW;
-                }
-
-                line.Point = velocity + 0.5f * u;
-                
-                if (lineCount < MAX_LINES)
-                {
-                    orcaLines[lineCount++] = line;
-                }
-            }
-
             float2 newVel = float2.zero;
-            int lineFail = linearProgram2(orcaLines, lineCount, maxSpeed, prefVelocity, false, ref newVel);
-
-            if (lineFail < lineCount)
-            {
-                linearProgram3(orcaLines, lineCount, 0, lineFail, maxSpeed, ref newVel);
-            }
-
-            newVelocities[agentIdx] = newVel;
+            ComputeSingleAgentVelocity(
+                in agents[i],
+                neighborIndices,
+                neighborCounts[i],
+                neighborOffsets[i],
+                obstacleNeighborIndices,
+                obstacleNeighborCounts[i],
+                obstacleNeighborOffsets[i],
+                obstacles,
+                timeStep,
+                orcaLines,
+                obstacleDists,
+                ref newVel,
+                // Accessors
+                agents, // agentListPtr
+                null, null, null // SoA pointers null
+            );
+            newVelocities[i] = newVel;
         }
     }
 
@@ -617,10 +620,11 @@ public static unsafe class SIMDRVO
         int* neighborIndices,
         int* neighborCounts,
         int* neighborOffsets,
+        int* obstacleNeighborIndices,
+        int* obstacleNeighborCounts,
+        int* obstacleNeighborOffsets,
         ObstacleData* obstacles,
         int obstacleCount,
-        ObstacleTreeNode* treeNodes,
-        int rootNodeIndex,
         float2* newVelocities,
         int agentCount,
         float timeStep)
@@ -631,379 +635,41 @@ public static unsafe class SIMDRVO
         ObstacleDist* obstacleDists = stackalloc ObstacleDist[MAX_OBSTACLES];
         ORCALine* orcaLines = stackalloc ORCALine[MAX_LINES];
 
-        for (int agentIdx = 0; agentIdx < agentCount; agentIdx++)
+        for (int i = 0; i < agentCount; i++)
         {
-            float2 position = positions[agentIdx];
-            float2 velocity = velocities[agentIdx];
-            float radius = radii[agentIdx];
-            AgentParameters param = agentParams[agentIdx];
-            float2 prefVelocity = prefVelocities[agentIdx];
-
-            int count = neighborCounts[agentIdx];
-            int offset = neighborOffsets[agentIdx];
-
-            int lineCount = 0;
-            
-            float invTimeHorizonObst = 1.0f / param.TimeHorizonObst;
-
-            // 1. Process Obstacles
-            int validObstacleCount = 0;
-
-            if (treeNodes != null && rootNodeIndex != -1)
+            // Construct temporary AgentData
+            AgentData agent = new AgentData
             {
-                float rangeSq = (param.TimeHorizonObst * param.MaxSpeed + radius); 
-                rangeSq = rangeSq * rangeSq;
-
-                QueryObstacleTreeRecursive(
-                    position,
-                    rangeSq,
-                    treeNodes,
-                    obstacles,
-                    rootNodeIndex,
-                    obstacleDists,
-                    ref validObstacleCount,
-                    MAX_OBSTACLES
-                );
-            }
-            else if (obstacleCount > 0)
-            {
-                for (int i = 0; i < obstacleCount; i++)
-                {
-                    float distSq = distSqPointLineSegment(obstacles[i].Point1, obstacles[i].Point2, position);
-                    
-                    if (validObstacleCount < MAX_OBSTACLES)
-                    {
-                        obstacleDists[validObstacleCount] = new ObstacleDist { Index = i, DistSq = distSq };
-                        validObstacleCount++;
-                    }
-                }
-
-                for (int i = 1; i < validObstacleCount; i++)
-                {
-                    ObstacleDist key = obstacleDists[i];
-                    int j = i - 1;
-                    while (j >= 0 && obstacleDists[j].DistSq > key.DistSq)
-                    {
-                        obstacleDists[j + 1] = obstacleDists[j];
-                        j--;
-                    }
-                    obstacleDists[j + 1] = key;
-                }
-            }
-
-            if (validObstacleCount > 0)
-            {
-                for (int i = 0; i < validObstacleCount; i++)
-                {
-                    int obstIdx = obstacleDists[i].Index;
-                    ObstacleData obstacle1 = obstacles[obstIdx];
-                    
-                    bool alreadyCovered = false;
-                    for (int j = 0; j < lineCount; ++j)
-                    {
-                        if (det(invTimeHorizonObst * (obstacle1.Point1 - position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * radius >= -RVO_EPSILON &&
-                            det(invTimeHorizonObst * (obstacle1.Point2 - position) - orcaLines[j].Point, orcaLines[j].Direction) - invTimeHorizonObst * radius >= -RVO_EPSILON)
-                        {
-                            alreadyCovered = true;
-                            break;
-                        }
-                    }
-                    if (alreadyCovered) continue;
-
-                    float2 relativePosition1 = obstacle1.Point1 - position;
-                    float2 relativePosition2 = obstacle1.Point2 - position;
-                    
-                    float distSq1 = absSq(relativePosition1);
-                    float distSq2 = absSq(relativePosition2);
-                    float radiusSq = radius * radius;
-
-                    float2 obstacleVec = obstacle1.Point2 - obstacle1.Point1;
-                    float s = math.dot(-relativePosition1, obstacleVec) / absSq(obstacleVec);
-                    float distSqLine = absSq(-relativePosition1 - s * obstacleVec);
-
-                    ORCALine line = default;
-                    bool lineAdded = false;
-
-                    if (s < 0.0f && distSq1 <= radiusSq)
-                    {
-                        if (obstacle1.IsConvex)
-                        {
-                            line.Point = new float2(0.0f, 0.0f);
-                            line.Direction = normalize(new float2(-relativePosition1.y, relativePosition1.x));
-                            lineAdded = true;
-                        }
-                    }
-                    else if (s > 1.0f && distSq2 <= radiusSq)
-                    {
-                        bool nextIsConvex = true;
-                        if (obstacle1.NextObstacleIdx != -1)
-                        {
-                            ObstacleData nextObs = obstacles[obstacle1.NextObstacleIdx];
-                            nextIsConvex = nextObs.IsConvex;
-                        }
-
-                        if (nextIsConvex)
-                        {
-                            line.Point = new float2(0.0f, 0.0f);
-                            line.Direction = normalize(new float2(-relativePosition2.y, relativePosition2.x));
-                            lineAdded = true;
-                        }
-                    }
-                    else if (s >= 0.0f && s <= 1.0f && distSqLine <= radiusSq)
-                    {
-                        line.Point = new float2(0.0f, 0.0f);
-                        line.Direction = -obstacle1.Direction;
-                        lineAdded = true;
-                    }
-                    else
-                    {
-                        float2 leftLegDirection, rightLegDirection;
-                        bool isLeftLegForeign = false;
-                        bool isRightLegForeign = false;
-
-                        if (s < 0.0f && distSqLine <= radiusSq)
-                        {
-                            if (!obstacle1.IsConvex) continue;
-                            
-                            obstacle1 = obstacles[obstIdx];
-                            
-                            float leg1 = math.sqrt(distSq1 - radiusSq);
-                            leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                            
-                            float leg2 = math.sqrt(distSq2 - radiusSq);
-                            rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                        }
-                        else if (s > 1.0f && distSqLine <= radiusSq)
-                        {
-                             float leg1 = math.sqrt(distSq1 - radiusSq);
-                             leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                             float leg2 = math.sqrt(distSq2 - radiusSq);
-                             rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                        }
-                        else
-                        {
-                            if (obstacle1.IsConvex)
-                            {
-                                float leg1 = math.sqrt(distSq1 - radiusSq);
-                                leftLegDirection = new float2(relativePosition1.x * leg1 - relativePosition1.y * radius, relativePosition1.x * radius + relativePosition1.y * leg1) / distSq1;
-                            }
-                            else leftLegDirection = -obstacle1.Direction;
-
-                            bool nextIsConvex = true;
-                            if (obstacle1.NextObstacleIdx != -1) nextIsConvex = obstacles[obstacle1.NextObstacleIdx].IsConvex;
-                            
-                            if (nextIsConvex)
-                            {
-                                float leg2 = math.sqrt(distSq2 - radiusSq);
-                                rightLegDirection = new float2(relativePosition2.x * leg2 + relativePosition2.y * radius, -relativePosition2.x * radius + relativePosition2.y * leg2) / distSq2;
-                            }
-                            else rightLegDirection = obstacle1.Direction;
-                        }
-
-                        ObstacleData leftNeighbor = default;
-                        bool hasLeft = obstacle1.PrevObstacleIdx != -1;
-                        if (hasLeft) leftNeighbor = obstacles[obstacle1.PrevObstacleIdx];
-
-                        if (obstacle1.IsConvex && hasLeft && det(leftLegDirection, -leftNeighbor.Direction) >= 0.0f)
-                        {
-                            leftLegDirection = -leftNeighbor.Direction;
-                            isLeftLegForeign = true;
-                        }
-
-                        ObstacleData rightNeighbor = default;
-                        bool hasRight = obstacle1.NextObstacleIdx != -1;
-                        if (hasRight) rightNeighbor = obstacles[obstacle1.NextObstacleIdx];
-
-                        if (hasRight && rightNeighbor.IsConvex && det(rightLegDirection, rightNeighbor.Direction) <= 0.0f)
-                        {
-                            rightLegDirection = rightNeighbor.Direction;
-                            isRightLegForeign = true;
-                        }
-
-                        float2 leftCutOff = invTimeHorizonObst * (obstacle1.Point1 - position);
-                        float2 rightCutOff = invTimeHorizonObst * (obstacle1.Point2 - position);
-                        float2 cutOffVector = rightCutOff - leftCutOff;
-
-                        float t = (obstacle1.Point1.Equals(obstacle1.Point2)) ? 0.5f : math.dot(velocity - leftCutOff, cutOffVector) / absSq(cutOffVector);
-                        float tLeft = math.dot(velocity - leftCutOff, leftLegDirection);
-                        float tRight = math.dot(velocity - rightCutOff, rightLegDirection);
-
-                        if ((t < 0.0f && tLeft < 0.0f) || (obstacle1.Point1.Equals(obstacle1.Point2) && tLeft < 0.0f && tRight < 0.0f))
-                        {
-                            float2 unitW = normalize(velocity - leftCutOff);
-                            line.Direction = new float2(unitW.y, -unitW.x);
-                            line.Point = leftCutOff + radius * invTimeHorizonObst * unitW;
-                            lineAdded = true;
-                        }
-                        else if (t > 1.0f && tRight < 0.0f)
-                        {
-                            float2 unitW = normalize(velocity - rightCutOff);
-                            line.Direction = new float2(unitW.y, -unitW.x);
-                            line.Point = rightCutOff + radius * invTimeHorizonObst * unitW;
-                            lineAdded = true;
-                        }
-                        else if (t >= 0.0f && t <= 1.0f)
-                        {
-                             float distSqCutoff = absSq(velocity - (leftCutOff + t * cutOffVector));
-                             float distSqLeft = tLeft < 0.0f ? float.PositiveInfinity : absSq(velocity - (leftCutOff + tLeft * leftLegDirection));
-                             float distSqRight = tRight < 0.0f ? float.PositiveInfinity : absSq(velocity - (rightCutOff + tRight * rightLegDirection));
-
-                             if (distSqCutoff <= distSqLeft && distSqCutoff <= distSqRight)
-                             {
-                                 line.Direction = -obstacle1.Direction;
-                                 line.Point = leftCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                 lineAdded = true;
-                             }
-                             else if (distSqLeft <= distSqRight)
-                             {
-                                 if (!isLeftLegForeign)
-                                 {
-                                     line.Direction = leftLegDirection;
-                                     line.Point = leftCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                     lineAdded = true;
-                                 }
-                             }
-                             else
-                             {
-                                 if (!isRightLegForeign)
-                                 {
-                                     line.Direction = rightLegDirection;
-                                     line.Point = rightCutOff + radius * invTimeHorizonObst * new float2(-line.Direction.y, line.Direction.x);
-                                     lineAdded = true;
-                                 }
-                             }
-                        }
-                    }
-
-                    if (lineAdded && lineCount < MAX_LINES)
-                    {
-                        orcaLines[lineCount++] = line;
-                    }
-                }
-            }
-
-            // 2. Process Agents
-            float invTimeHorizon = 1.0f / param.TimeHorizon;
-
-            for (int i = 0; i < count; ++i)
-            {
-                int neighborIdx = neighborIndices[offset + i];
-                // Note: neighborIdx is global index. Access SoA arrays.
-                
-                float2 otherPos = positions[neighborIdx];
-                float2 otherVel = velocities[neighborIdx];
-                float otherRadius = radii[neighborIdx];
-
-                float2 relativePosition = otherPos - position;
-                float2 relativeVelocity = velocity - otherVel;
-                float distSq = math.lengthsq(relativePosition);
-                float combinedRadius = radius + otherRadius;
-                float combinedRadiusSq = combinedRadius * combinedRadius;
-
-                ORCALine line;
-                float2 u;
-
-                if (distSq > combinedRadiusSq)
-                {
-                    float2 w = relativeVelocity - invTimeHorizon * relativePosition;
-                    float wLengthSq = math.lengthsq(w);
-                    float dotProduct1 = math.dot(w, relativePosition);
-
-                    if (dotProduct1 < 0.0f && dotProduct1 * dotProduct1 > combinedRadiusSq * wLengthSq)
-                    {
-                        float wLength = math.sqrt(wLengthSq);
-                        float2 unitW = w / wLength;
-
-                        line.Direction = new float2(unitW.y, -unitW.x);
-                        u = (combinedRadius * invTimeHorizon - wLength) * unitW;
-                    }
-                    else
-                    {
-                        float leg = math.sqrt(distSq - combinedRadiusSq);
-                        if (det(relativePosition, w) > 0.0f)
-                        {
-                            line.Direction = new float2(relativePosition.x * leg - relativePosition.y * combinedRadius, 
-                                                       relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                        }
-                        else
-                        {
-                            line.Direction = -new float2(relativePosition.x * leg + relativePosition.y * combinedRadius, 
-                                                        -relativePosition.x * combinedRadius + relativePosition.y * leg) / distSq;
-                        }
-
-                        float dotProduct2 = math.dot(relativeVelocity, line.Direction);
-                        u = dotProduct2 * line.Direction - relativeVelocity;
-                    }
-                }
-                else
-                {
-                    float invTimeStep = 1.0f / timeStep;
-                    float2 w = relativeVelocity - invTimeStep * relativePosition;
-                    float wLength = math.length(w);
-                    float2 unitW = w / wLength;
-
-                    line.Direction = new float2(unitW.y, -unitW.x);
-                    u = (combinedRadius * invTimeStep - wLength) * unitW;
-                }
-
-                line.Point = velocity + 0.5f * u;
-                
-                if (lineCount < MAX_LINES)
-                {
-                    orcaLines[lineCount++] = line;
-                }
-            }
+                Position = positions[i],
+                Velocity = velocities[i],
+                PrefVelocity = prefVelocities[i],
+                Radius = radii[i],
+                MaxSpeed = agentParams[i].MaxSpeed,
+                NeighborDist = agentParams[i].NeighborDist,
+                MaxNeighbors = agentParams[i].MaxNeighbors,
+                TimeHorizon = agentParams[i].TimeHorizon,
+                TimeHorizonObst = agentParams[i].TimeHorizonObst
+            };
 
             float2 newVel = float2.zero;
-            int lineFail = linearProgram2(orcaLines, lineCount, param.MaxSpeed, prefVelocity, false, ref newVel);
-
-            if (lineFail < lineCount)
-            {
-                linearProgram3(orcaLines, lineCount, 0, lineFail, param.MaxSpeed, ref newVel);
-            }
-
-            newVelocities[agentIdx] = newVel;
-        }
-    }
-
-    private static void QueryObstacleTreeRecursive(
-        float2 position,
-        float rangeSq,
-        ObstacleTreeNode* treeNodes,
-        ObstacleData* treeObstacles,
-        int nodeIdx,
-        ObstacleDist* results,
-        ref int resultCount,
-        int maxResults)
-    {
-        if (nodeIdx == -1) return;
-
-        ObstacleTreeNode node = treeNodes[nodeIdx];
-        ObstacleData obstacle1 = treeObstacles[node.ObstacleIndex];
-
-        float2 p1 = obstacle1.Point1;
-        float2 p2 = obstacle1.Point2;
-
-        float agentLeftOfLine = det(p2 - p1, position - p1);
-
-        QueryObstacleTreeRecursive(position, rangeSq, treeNodes, treeObstacles,
-            agentLeftOfLine >= 0.0f ? node.LeftNodeIndex : node.RightNodeIndex,
-            results, ref resultCount, maxResults);
-
-        float distSqLine = (agentLeftOfLine * agentLeftOfLine) / absSq(p2 - p1);
-
-        if (distSqLine < rangeSq)
-        {
-            if (agentLeftOfLine < 0.0f)
-            {
-                // Insert maintaining sort
-                float distSq = distSqPointLineSegment(p1, p2, position);
-                InsertObstacleNeighbor(node.ObstacleIndex, distSq, results, ref resultCount, maxResults);
-            }
-
-            QueryObstacleTreeRecursive(position, rangeSq, treeNodes, treeObstacles,
-                agentLeftOfLine >= 0.0f ? node.RightNodeIndex : node.LeftNodeIndex,
-                results, ref resultCount, maxResults);
+            ComputeSingleAgentVelocity(
+                in agent,
+                neighborIndices,
+                neighborCounts[i],
+                neighborOffsets[i],
+                obstacleNeighborIndices,
+                obstacleNeighborCounts[i],
+                obstacleNeighborOffsets[i],
+                obstacles,
+                timeStep,
+                orcaLines,
+                obstacleDists,
+                ref newVel,
+                // Accessors
+                null, // agentListPtr null
+                positions, velocities, radii // SoA pointers
+            );
+            newVelocities[i] = newVel;
         }
     }
 
@@ -1016,11 +682,7 @@ public static unsafe class SIMDRVO
         }
         else
         {
-            // If full, check if new one is closer than furthest?
-            // Since we want CLOSEST neighbors, and we might discard far ones.
-            // obstacleDists array should keep closest.
-            // But usually we just take first N.
-            // If we have sort logic, we should replace the worst one if better.
+            // If full, replace furthest if new one is closer
             if (distSq >= results[count - 1].DistSq) return;
             
             results[count - 1] = new ObstacleDist { Index = index, DistSq = distSq };

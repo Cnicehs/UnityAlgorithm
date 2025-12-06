@@ -16,6 +16,7 @@ public class SIMDRVOSimulator
     public int MaxNeighbors = 10;
     public float TimeHorizon = 2.0f;
     public float TimeHorizonObst = 2.0f;
+    public int MaxObstacleNeighbors = 32;
     public float Radius = 0.5f;
     public float MaxSpeed = 2.0f;
 
@@ -31,15 +32,21 @@ public class SIMDRVOSimulator
     private NativeArray<int> _neighborCounts;
     private NativeArray<int> _neighborOffsets;
 
+    private NativeArray<int> _obstacleNeighborIndices;
+    private NativeArray<int> _obstacleNeighborCounts;
+    private NativeArray<int> _obstacleNeighborOffsets;
+
     private NativeArray<SIMDRVO.ObstacleData> _nativeObstacles;
     private int _obstacleCount;
-    private SIMDSegmentKdTreeIndex _segmentSpatialIndex;
+    // Use Linear Index as requested/implied by "brute force" direction
+    private SIMDLinearSegmentIndex _segmentSpatialIndex;
 
     private List<Vector2> _positionCache = new List<Vector2>();
+    private List<int> _tempObstacleNeighbors = new List<int>();
 
     private SIMDRVOSimulator()
     {
-        _segmentSpatialIndex = new SIMDSegmentKdTreeIndex();
+        _segmentSpatialIndex = new SIMDLinearSegmentIndex();
     }
 
     public void Initialize(int count)
@@ -49,6 +56,9 @@ public class SIMDRVOSimulator
         if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
+        if (_obstacleNeighborIndices.IsCreated) _obstacleNeighborIndices.Dispose();
+        if (_obstacleNeighborCounts.IsCreated) _obstacleNeighborCounts.Dispose();
+        if (_obstacleNeighborOffsets.IsCreated) _obstacleNeighborOffsets.Dispose();
         if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
 
         _agents = new NativeArray<SIMDRVO.AgentData>(count, Allocator.Persistent);
@@ -59,6 +69,11 @@ public class SIMDRVOSimulator
         _neighborIndices = new NativeArray<int>(totalNeighborSlots, Allocator.Persistent);
         _neighborCounts = new NativeArray<int>(count, Allocator.Persistent);
         _neighborOffsets = new NativeArray<int>(count, Allocator.Persistent);
+
+        int totalObstacleNeighborSlots = count * MaxObstacleNeighbors;
+        _obstacleNeighborIndices = new NativeArray<int>(totalObstacleNeighborSlots, Allocator.Persistent);
+        _obstacleNeighborCounts = new NativeArray<int>(count, Allocator.Persistent);
+        _obstacleNeighborOffsets = new NativeArray<int>(count, Allocator.Persistent);
         
         _agentCount = count;
     }
@@ -106,6 +121,9 @@ public class SIMDRVOSimulator
         if (_neighborIndices.IsCreated) _neighborIndices.Dispose();
         if (_neighborCounts.IsCreated) _neighborCounts.Dispose();
         if (_neighborOffsets.IsCreated) _neighborOffsets.Dispose();
+        if (_obstacleNeighborIndices.IsCreated) _obstacleNeighborIndices.Dispose();
+        if (_obstacleNeighborCounts.IsCreated) _obstacleNeighborCounts.Dispose();
+        if (_obstacleNeighborOffsets.IsCreated) _obstacleNeighborOffsets.Dispose();
         if (_nativeObstacles.IsCreated) _nativeObstacles.Dispose();
         _segmentSpatialIndex?.Dispose();
     }
@@ -114,6 +132,13 @@ public class SIMDRVOSimulator
     {
         Dispose();
     }
+
+    // Debug Helpers
+    public NativeArray<SIMDRVO.ObstacleData> GetObstacles() => _nativeObstacles;
+    public NativeArray<SIMDRVO.AgentData> GetAgents() => _agents;
+    public int GetObstacleNeighborCount(int agentIndex) => _obstacleNeighborCounts.IsCreated ? _obstacleNeighborCounts[agentIndex] : 0;
+    public int GetObstacleNeighborOffset(int agentIndex) => _obstacleNeighborOffsets.IsCreated ? _obstacleNeighborOffsets[agentIndex] : 0;
+    public NativeArray<int> GetObstacleNeighborIndices() => _obstacleNeighborIndices;
 
     public void UpdateObstacles(List<RVOObstacle> obstacles)
     {
@@ -198,7 +223,7 @@ public class SIMDRVOSimulator
             _nativeObstacles[i] = dest;
         }
 
-        // 3. Build Spatial Index
+        // 3. Build Spatial Index (Linear)
         _segmentSpatialIndex.Build(_nativeObstacles);
     }
 
@@ -211,13 +236,10 @@ public class SIMDRVOSimulator
             // 1. Build Neighbor Lists (Main Thread)
             using (PerformanceProfiler.ProfilerScope.Begin("SIMDRVO.NeighborQuery"))
             {
-                // Optimization: If using SIMDQuadTreeIndex, use its Batch Query (Burst)
-                // This avoids C# overhead of looping 500+ agents, allocating lists, and sorting in managed code.
                 var spatialIndex = SpatialIndexManager.Instance.GetCurrentIndex();
                 if (spatialIndex is SIMDQuadTreeIndex quadTree)
                 {
-                    // Initialize offsets (Must be done BEFORE query as QueryNeighborsBatch reads them)
-                    // Using fixed stride: i * MaxNeighbors
+                    // Initialize offsets
                     for(int i=0; i<_agentCount; i++) _neighborOffsets[i] = i * MaxNeighbors;
 
                     quadTree.QueryNeighborsBatch(
@@ -235,6 +257,9 @@ public class SIMDRVOSimulator
                     {
                         var agent = _agents[i];
                         _tempNeighbors.Clear();
+                        // Important: Pass agent Radius + NeighborDist to ensure we find neighbors within RVO horizon
+                        // Also, SIMD RVO logic in ComputeSingleAgentVelocity uses agent.NeighborDist directly.
+                        // We must ensure spatial query radius >= agent.NeighborDist.
                         SpatialIndexManager.Instance.GetNeighborsInRadius(agent.Position, agent.NeighborDist, _tempNeighbors);
 
                         // Sort neighbors by distance to ensure we pick the closest ones
@@ -266,6 +291,39 @@ public class SIMDRVOSimulator
                         _neighborOffsets[i] = offset;
                     }
                 }
+
+                // 1.5 Build Obstacle Neighbor Lists
+                if (_nativeObstacles.IsCreated)
+                {
+                     for (int i = 0; i < _agentCount; i++)
+                     {
+                        var agent = _agents[i];
+                        _tempObstacleNeighbors.Clear();
+                        
+                        // Query nearby obstacles
+                        // Use TimeHorizonObst * MaxSpeed + Radius as range, similar to logic inside SIMDRVO
+                        float range = agent.TimeHorizonObst * agent.MaxSpeed + agent.Radius;
+                        _segmentSpatialIndex.QueryNearest(agent.Position, range, _tempObstacleNeighbors);
+
+                        int offset = i * MaxObstacleNeighbors;
+                        int count = 0;
+                        int maxForThis = math.min(MaxObstacleNeighbors, _obstacleNeighborIndices.Length - offset);
+
+                        for (int j = 0; j < _tempObstacleNeighbors.Count && count < maxForThis; j++)
+                        {
+                            _obstacleNeighborIndices[offset + count] = _tempObstacleNeighbors[j];
+                            count++;
+                        }
+                        
+                        _obstacleNeighborCounts[i] = count;
+                        _obstacleNeighborOffsets[i] = offset;
+                     }
+                }
+                else
+                {
+                    // Zero out if no obstacles
+                    for(int i=0; i<_agentCount; i++) _obstacleNeighborCounts[i] = 0;
+                }
             }
 
             // 2. Compute RVO velocities using Burst (Single-threaded, SIMD-accelerated)
@@ -273,40 +331,25 @@ public class SIMDRVOSimulator
             {
                 SIMDRVO.ObstacleData* obstPtr = null;
                 int obstCount = 0;
-                SIMDRVO.ObstacleTreeNode* nodePtr = null;
-                int rootIdx = -1;
 
                 if (_nativeObstacles.IsCreated)
                 {
-                    // Use Tree Data if available (and built)
-                    // SIMDSegmentKdTreeIndex builds _treeObstacles which might be larger than _nativeObstacles due to splits
-                    var treeObs = _segmentSpatialIndex.GetTreeObstacles();
-                    var treeNodes = _segmentSpatialIndex.GetTreeNodes();
-                    
-                    if (treeObs.IsCreated && treeNodes.IsCreated)
-                    {
-                        obstPtr = (SIMDRVO.ObstacleData*)treeObs.GetUnsafePtr();
-                        obstCount = _segmentSpatialIndex.GetTreeObstacleCount();
-                        nodePtr = (SIMDRVO.ObstacleTreeNode*)treeNodes.GetUnsafePtr();
-                        rootIdx = _segmentSpatialIndex.GetRootNodeIndex();
-                    }
-                    else
-                    {
-                        // Fallback to linear if tree not built (shouldn't happen if UpdateObstacles called)
-                        obstPtr = (SIMDRVO.ObstacleData*)_nativeObstacles.GetUnsafePtr();
-                        obstCount = _obstacleCount;
-                    }
+                    // For Linear/Brute Force, just pass the array
+                    obstPtr = (SIMDRVO.ObstacleData*)_nativeObstacles.GetUnsafePtr();
+                    obstCount = _obstacleCount;
                 }
 
+                // Call SIMDRVO with NO Tree nodes (null)
                 SIMDRVO.ComputeRVOVelocities(
                     (SIMDRVO.AgentData*)_agents.GetUnsafePtr(),
                     (int*)_neighborIndices.GetUnsafePtr(),
                     (int*)_neighborCounts.GetUnsafePtr(),
                     (int*)_neighborOffsets.GetUnsafePtr(),
+                    (int*)_obstacleNeighborIndices.GetUnsafePtr(),
+                    (int*)_obstacleNeighborCounts.GetUnsafePtr(),
+                    (int*)_obstacleNeighborOffsets.GetUnsafePtr(),
                     obstPtr,
                     obstCount,
-                    nodePtr,
-                    rootIdx,
                     (float2*)_newVelocities.GetUnsafePtr(),
                     _agentCount,
                     dt
